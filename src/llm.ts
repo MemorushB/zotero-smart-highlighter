@@ -542,5 +542,8 @@ export async function selectGlobalHighlightCandidateIds(
     { role: "user", content: buildGlobalRankingUserPrompt(candidates, maxHighlights, paperTitle) },
   ], options);
 
-  return coerceSelectedHighlights(parsed, validIds);
+  const result = coerceSelectedHighlights(parsed, validIds);
+  Zotero.debug(`[SmartHighlight] Global selection raw response keys: ${Object.keys(parsed).join(', ')}`);
+  Zotero.debug(`[SmartHighlight] Global selection parsed ${result.length} highlights with reasons: ${result.map(r => r.reason || '(none)').join(', ')}`);
+  return result;
 }

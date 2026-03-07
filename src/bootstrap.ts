@@ -63,6 +63,18 @@ function getHighlightColor(reason?: string): string {
     return '#ffd400';
 }
 
+function inferReasonFromText(text: string): string {
+    const t = text.toLowerCase();
+
+    if (/\b(method|approach|algorithm|procedure|framework|pipeline|architecture|implementation|technique|protocol|workflow|fine-tun|train|pretrain)\b/.test(t)) return 'method';
+    if (/\b(result|finding|found|observe|show that|demonstrate|achiev|outperform|accuracy|performance|improvement|f1.score|precision|recall|bleu|rouge)\b/.test(t)) return 'result';
+    if (/\b(caveat|limitation|however|although|despite|drawback|shortcoming|fail|degrad|inconsisten|trade.?off|risk|bias|concern)\b/.test(t)) return 'caveat';
+    if (/\b(we propose|we introduce|we present|we argue|contribution|novel|first to|key insight|hypothesis|we claim|this paper)\b/.test(t)) return 'claim';
+    if (/\b(previous|prior work|related work|background|existing|established|well.known|widely used|traditionally|literature)\b/.test(t)) return 'background';
+
+    return 'result';
+}
+
 function isTextareaPreferenceControl(control: Element): boolean {
     const tagName = control.tagName?.toLowerCase();
     return tagName === 'textarea' || tagName === 'html:textarea';
@@ -1218,6 +1230,7 @@ async function createSelectionHighlightsFallback(
         try {
             const rects = computeSpanRects(text, baseRects, span.start, span.end);
             if (rects.length === 0) continue;
+            const reason = span.reason || inferReasonFromText(span.text);
 
             const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
                 || Zotero.Utilities?.generateObjectKey?.()
@@ -1226,9 +1239,9 @@ async function createSelectionHighlightsFallback(
             const annotationData = {
                 key: annotationKey,
                 type: 'highlight',
-                color: getHighlightColor(span.reason),
+                color: getHighlightColor(reason),
                 text: span.text,
-                comment: span.reason ? `[${span.reason}]` : '',
+                comment: reason ? `[${reason}]` : '',
                 position: {
                     pageIndex: pageIndex,
                     rects: rects,
@@ -1461,6 +1474,7 @@ async function createSelectionHighlightsWithCharPositions(
             let layer1SpanGeometryFailed = false;
             let layer2AttemptedForSpan = false;
             let layer2SpanGeometryFailed = false;
+            const reason = span.reason || inferReasonFromText(span.text);
 
             let geometry: LayeredSpanGeometry | null = null;
 
@@ -1519,9 +1533,9 @@ async function createSelectionHighlightsWithCharPositions(
             const annotationData = {
                 key: annotationKey,
                 type: 'highlight',
-                color: getHighlightColor(span.reason),
+                color: getHighlightColor(reason),
                 text: span.text,
-                comment: span.reason ? `[${span.reason}]` : '',
+                comment: reason ? `[${reason}]` : '',
                 position: {
                     pageIndex: pageIndex,
                     rects: mergedRects,
@@ -2658,7 +2672,10 @@ export function startup(data: BootstrapData, reason: number) {
 
                 const finalCandidates = finalizeGlobalHighlightSelection(preparedSelection, selectedIds, minConfidence);
                 for (const candidate of finalCandidates) {
-                    candidate.reason = reasonById.get(candidate.id) || candidate.reason;
+                    candidate.reason = reasonById.get(candidate.id) ?? candidate.reason;
+                    if (!candidate.reason) {
+                        candidate.reason = inferReasonFromText(candidate.text);
+                    }
                 }
                 if (!finalCandidates.length) {
                     button.textContent = 'No highlights';
