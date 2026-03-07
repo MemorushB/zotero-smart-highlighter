@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.xpi
 addon/content/scripts/
+.scaffold/
+.env
+.DS_Store
+.opencode-zotero-dev.log
