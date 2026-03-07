@@ -2410,7 +2410,7 @@ async function createPaperHighlightAnnotation(
         type: 'highlight',
         color: getHighlightColor(candidate.reason),
         text: candidate.text,
-        comment: candidate.reason ? `[${candidate.reason}] ${candidate.sectionTitle || ''}`.trim() : (candidate.sectionTitle ? `[${candidate.sectionTitle}]` : ''),
+        comment: candidate.reason ? `[${candidate.reason}]` : (candidate.sectionTitle ? `[${candidate.sectionTitle}]` : ''),
         position: {
             pageIndex,
             rects: mergedRects,
