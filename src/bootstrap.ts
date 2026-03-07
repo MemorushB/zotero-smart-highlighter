@@ -1,10 +1,19 @@
 declare const Zotero: any;
 declare const cloneInto: ((value: any, targetScope: any, options?: any) => any) | undefined;
 
-import { extractEntities, type NerEntity } from "./llm";
-import { colorForEntityType } from "./entity-colors";
+import { extractSelectionHighlights, selectGlobalHighlightCandidateIds } from "./llm";
 import { computeEntityRects } from "./rect-splitter";
 import { DEFAULT_SYSTEM_PROMPT, PREF_DEFAULTS, PREF_PREFIX, getStoredSystemPromptOverride } from "./preferences";
+import {
+    finalizeGlobalHighlightSelection,
+    inferSectionTitle,
+    prepareGlobalHighlightSelection,
+    validateQuickHighlightSpans,
+    type PaperPageText,
+    type PreparedGlobalHighlightSelection,
+    type ReadingHighlightCandidate,
+    type ReadingHighlightSpan,
+} from "./reading-highlights";
 
 export interface BootstrapData {
     id: string;
@@ -15,15 +24,18 @@ export interface BootstrapData {
 
 let registeredHandler: ((event: any) => void) | null = null;
 let toolbarHandler: ((event: any) => void) | null = null;
-const selectionNerInFlight = new Map<string, Promise<void>>();
-const FALLBACK_HIGHLIGHT_COLOR = '#ffd400';
-const HIGHLIGHT_FAILURE_MESSAGE = 'Could not create a highlight from this selection.';
+const selectionHighlightInFlight = new Map<string, Promise<void>>();
+const READING_HIGHLIGHT_COLOR = '#ffd400';
+const HIGHLIGHT_FAILURE_MESSAGE = 'Could not create reading highlights from this selection.';
 const SELECTION_RECT_OVERLAP_TOLERANCE = 2;
 const SELECTION_CHAR_WINDOW_PADDING = 24;
-const SELECTION_NER_REQUEST_TIMEOUT_MS = 45_000;
-const SELECTION_NER_REQUEST_ATTEMPTS = 1;
+const SELECTION_HIGHLIGHT_REQUEST_TIMEOUT_MS = 30_000;
+const SELECTION_HIGHLIGHT_REQUEST_ATTEMPTS = 1;
 const SELECTION_GEOMETRY_TIMEOUT_MS = 5_000;
 const POPUP_PAGE_BOOTSTRAP_TIMEOUT_MS = 750;
+const SELECTION_CONTEXT_WINDOW_CHARS = 180;
+const GLOBAL_HIGHLIGHT_REQUEST_TIMEOUT_MS = 45_000;
+const GLOBAL_HIGHLIGHT_REQUEST_ATTEMPTS = 1;
 const MATCH_SPACE_CHARACTERS = /[\s\u00A0\u1680\u180E\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/u;
 const MATCH_ZERO_WIDTH_CHARACTERS = /[\u200B\u200C\u200D\u2060\uFEFF]/u;
 const MATCH_OPENING_PUNCTUATION = new Set(['(', '[', '{']);
@@ -136,7 +148,7 @@ interface PopupPageIndexResolution {
     debugMessage: string | null;
 }
 
-type SelectionPopupProgressStage = 'extracting-entities' | 'preparing-geometry' | 'applying-highlights' | 'falling-back';
+type SelectionPopupProgressStage = 'analyzing-selection' | 'preparing-geometry' | 'applying-highlights';
 
 type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => void;
 
@@ -163,12 +175,12 @@ function showTemporaryButtonState(button: any, event: any, text: string, duratio
     const timerHost = event?.doc?.defaultView;
     if (timerHost && typeof timerHost.setTimeout === 'function') {
         timerHost.setTimeout(() => {
-            setButtonState(button, '🔬 NER Highlight', false);
+            setButtonState(button, '✨ Quick Highlight', false);
         }, durationMs);
         return;
     }
 
-    setButtonState(button, '🔬 NER Highlight', false);
+    setButtonState(button, '✨ Quick Highlight', false);
 }
 
 function clearPreference(prefKey: string): void {
@@ -184,14 +196,12 @@ function clearPreference(prefKey: string): void {
 
 function getSelectionPopupProgressText(stage: SelectionPopupProgressStage): string {
     switch (stage) {
-        case 'extracting-entities':
-            return '⏳ Extracting entities...';
+        case 'analyzing-selection':
+            return '⏳ Reading selection...';
         case 'preparing-geometry':
             return '⏳ Locating text...';
         case 'applying-highlights':
             return '⏳ Applying highlights...';
-        case 'falling-back':
-            return '⏳ Falling back...';
     }
 }
 
@@ -279,6 +289,80 @@ function getReaderAttachment(reader: any): any {
     return reader?._item ?? null;
 }
 
+function getPaperTitle(reader: any): string | null {
+    const attachment = getReaderAttachment(reader);
+    const parentItem = typeof attachment?.parentItem === 'function'
+        ? attachment.parentItem()
+        : attachment?.parentItem ?? null;
+
+    const title = parentItem?.getField?.('title')
+        ?? attachment?.getField?.('title')
+        ?? parentItem?.title
+        ?? attachment?.title;
+
+    return typeof title === 'string' && title.trim() ? title.trim() : null;
+}
+
+async function buildSelectionContext(reader: any, annotationBase: any, selectedText: string): Promise<{
+    paperTitle: string | null;
+    sectionTitle: string | null;
+    beforeContext: string;
+    afterContext: string;
+}> {
+    const paperTitle = getPaperTitle(reader);
+    const popupPageIndex = resolvePopupPageIndex(reader, annotationBase);
+    if (popupPageIndex.pageIndex === null) {
+        return {
+            paperTitle,
+            sectionTitle: null,
+            beforeContext: '',
+            afterContext: '',
+        };
+    }
+
+    const internal = reader?._internalReader || reader;
+    const selectionRects = annotationBase.position?.rects ?? [];
+    const charPositions = await getCharPositionsForPage(internal, popupPageIndex.pageIndex, {
+        includeSyntheticEOL: true,
+        allowUnsafeDefaultTextExtraction: false,
+        timeoutMs: SELECTION_GEOMETRY_TIMEOUT_MS,
+    });
+    if (!charPositions.length) {
+        return {
+            paperTitle,
+            sectionTitle: null,
+            beforeContext: '',
+            afterContext: '',
+        };
+    }
+
+    const pageText = charPositions.map(position => position.char).join('');
+    const selectionWindow = findSelectionCharWindow(charPositions, selectionRects);
+    const selectionMatch = findTextMatch(
+        pageText,
+        selectedText,
+        0,
+        selectionWindow ? { start: selectionWindow.start, end: selectionWindow.end + 1 } : undefined
+    );
+    if (!selectionMatch) {
+        return {
+            paperTitle,
+            sectionTitle: null,
+            beforeContext: '',
+            afterContext: '',
+        };
+    }
+
+    const selectionStart = selectionMatch.rawStart;
+    const selectionEnd = selectionStart + selectedText.length;
+    return {
+        paperTitle,
+        sectionTitle: inferSectionTitle(pageText, selectionStart),
+        beforeContext: pageText.slice(Math.max(0, selectionStart - SELECTION_CONTEXT_WINDOW_CHARS), selectionStart).trim(),
+        afterContext: pageText.slice(selectionEnd, Math.min(pageText.length, selectionEnd + SELECTION_CONTEXT_WINDOW_CHARS)).trim(),
+    };
+}
+
 async function awaitWithOptionalTimeout<T>(promise: Promise<T>, options: AsyncTimeoutOptions = {}): Promise<T> {
     const { timeoutMs, timeoutLabel = 'Async operation', onTimeout } = options;
     if (!timeoutMs || timeoutMs <= 0) return promise;
@@ -363,7 +447,7 @@ function getSafeAnnotationPayload(annotation: any): any {
             ? annotation.key
             : Zotero.DataObjectUtilities?.generateKey?.() || Zotero.Utilities?.generateObjectKey?.() || `highlight_${Date.now()}`,
         type: typeof annotation?.type === 'string' && annotation.type.length ? annotation.type : 'highlight',
-        color: typeof annotation?.color === 'string' && annotation.color.length ? annotation.color : FALLBACK_HIGHLIGHT_COLOR,
+        color: typeof annotation?.color === 'string' && annotation.color.length ? annotation.color : READING_HIGHLIGHT_COLOR,
         text: typeof annotation?.text === 'string' ? annotation.text : '',
         comment: typeof annotation?.comment === 'string' ? annotation.comment : '',
         tags: getSafeAnnotationTags(annotation?.tags),
@@ -1037,30 +1121,13 @@ async function createSingleHighlight(
     return false;
 }
 
-// ── Fallback: single yellow highlight ────────────────────────────────
+// ── Selection-only reading highlights ────────────────────────────────
 
-async function createFallbackHighlight(event: any): Promise<boolean> {
-    const base = getSafeSelectionAnnotationSnapshot(event?.params?.annotation);
-    if (!base?.position) return false;
-
-    Zotero.debug('[Zotero PDF Highlighter] using fallback single yellow highlight');
-    return createSingleHighlight(
-        event,
-        base,
-        FALLBACK_HIGHLIGHT_COLOR,
-        base.position.rects,
-        base.text || '',
-        'save'
-    );
-}
-
-// ── NER-powered multi-entity highlighting ────────────────────────────
-
-async function createNerHighlightsFallback(
+async function createSelectionHighlightsFallback(
     reader: any,
     annotationBase: any,
     text: string,
-    entities: NerEntity[]
+    spans: ReadingHighlightSpan[]
 ): Promise<number> {
     let created = 0;
     const internal = reader?._internalReader || reader;
@@ -1096,53 +1163,53 @@ async function createNerHighlightsFallback(
         Zotero.debug(`[Zotero PDF Highlighter] Fallback: No attachment found, itemID=${itemID}`);
     }
 
-    for (const entity of entities) {
+    for (const span of spans) {
         try {
-            const color = colorForEntityType(entity.type) || '#ffd400';
-            const rects = computeEntityRects(text, baseRects, entity.start, entity.end);
+            const rects = computeEntityRects(text, baseRects, span.start, span.end);
             if (rects.length === 0) continue;
 
             const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
                 || Zotero.Utilities?.generateObjectKey?.()
-                || `ner_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                || `reading_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
             const annotationData = {
                 key: annotationKey,
                 type: 'highlight',
-                color: color,
-                text: entity.text,
-                comment: `[${entity.type}]`,
+                color: READING_HIGHLIGHT_COLOR,
+                text: span.text,
+                comment: span.reason ? `[${span.reason}]` : '',
                 position: {
                     pageIndex: pageIndex,
                     rects: rects,
                 },
                 pageLabel: annotationBase.pageLabel || String(pageIndex + 1),
-                sortIndex: getEntityFallbackSortIndex(annotationBase, pageIndex, entity.start, rects),
+                sortIndex: getEntityFallbackSortIndex(annotationBase, pageIndex, span.start, rects),
                 tags: [],
             };
 
-            Zotero.debug(`[Zotero PDF Highlighter] Creating annotation with color: ${color}`);
+            Zotero.debug('[Zotero PDF Highlighter] Creating selection reading highlight');
 
-            // Primary: Use Zotero.Annotations.saveFromJSON (most reliable)
             if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
                 try {
-                    await saveAnnotationJsonToAttachment(attachment, annotationData);
-                    Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via saveFromJSON`);
-                    created++;
-                    refreshAnnotationView(internal);
-                    continue;  // Success, move to next entity
+                    if (await saveAnnotationJsonToAttachment(attachment, annotationData)) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via saveFromJSON`);
+                        created++;
+                        refreshAnnotationView(internal);
+                        continue;
+                    }
+
+                    Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON returned false for selection highlight "${span.text}"`);
                 } catch (saveErr: any) {
                     Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON failed: ${saveErr?.message}`);
                 }
             } else {
-                Zotero.debug(`[Zotero PDF Highlighter] Fallback: Skipping saveFromJSON: attachment=${!!attachment}, saveFromJSON=${typeof Zotero.Annotations?.saveFromJSON}`);
+                Zotero.debug(`[Zotero PDF Highlighter] Selection fallback: Skipping saveFromJSON: attachment=${!!attachment}, saveFromJSON=${typeof Zotero.Annotations?.saveFromJSON}`);
             }
 
-            // Secondary fallback: Try annotation manager
             if (mgr && typeof mgr.addAnnotation === 'function') {
                 try {
                     if (await addAnnotationViaManager(reader, mgr, annotationData)) {
-                        Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via addAnnotation`);
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via addAnnotation`);
                         created++;
                         refreshAnnotationView(internal);
                         continue;
@@ -1152,20 +1219,20 @@ async function createNerHighlightsFallback(
                 }
             }
 
-            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${entity.text}"`);
+            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${span.text}"`);
         } catch (e: any) {
-            Zotero.debug(`[Zotero PDF Highlighter] Fallback error for "${entity.text}": ${e?.message}`);
+            Zotero.debug(`[Zotero PDF Highlighter] Selection fallback error for "${span.text}": ${e?.message}`);
         }
     }
 
     return created;
 }
 
-async function createNerHighlightsWithCharPositions(
+async function createSelectionHighlightsWithCharPositions(
     reader: any,
     annotationBase: any,
     text: string,
-    entities: NerEntity[],
+    spans: ReadingHighlightSpan[],
     onProgress?: SelectionPopupProgressHandler
 ): Promise<number> {
     let created = 0;
@@ -1184,9 +1251,8 @@ async function createNerHighlightsWithCharPositions(
         Zotero.debug(`[Zotero PDF Highlighter] ${popupPageIndex.debugMessage}`);
     }
     if (popupPageIndex.pageIndex === null) {
-        onProgress?.('falling-back');
         Zotero.debug('[Zotero PDF Highlighter] Popup final layer 3 fallback reason: popup pageIndex was unavailable for safe current-page geometry');
-        return createNerHighlightsFallback(reader, annotationBase, text, entities);
+        return 0;
     }
 
     const pageIndex = popupPageIndex.pageIndex;
@@ -1328,20 +1394,18 @@ async function createNerHighlightsWithCharPositions(
     }
 
     if (!internalPageData && !layer2SelectionMatch) {
-        onProgress?.('falling-back');
         const layer3FallbackReason = geometryTimedOut
             ? 'selection geometry timed out before layer 1 or layer 2 resolved'
             : popupGeometryDiagnostics.layer2SelectionMatchFailureReason
                 || popupGeometryDiagnostics.layer1CharsUnavailableReason
                 || 'selection geometry was unavailable in both layer 1 and layer 2';
         Zotero.debug(`[Zotero PDF Highlighter] Popup final layer 3 fallback reason: ${layer3FallbackReason}`);
-        return createNerHighlightsFallback(reader, annotationBase, text, entities);
+        return createSelectionHighlightsFallback(reader, annotationBase, text, spans);
     }
 
     onProgress?.('applying-highlights');
-    for (const entity of entities) {
+    for (const span of spans) {
         try {
-            const color = colorForEntityType(entity.type) || '#ffd400';
             let layer1AttemptedForEntity = false;
             let layer1EntityGeometryFailed = false;
             let layer2AttemptedForEntity = false;
@@ -1351,62 +1415,62 @@ async function createNerHighlightsWithCharPositions(
 
             if (internalPageData) {
                 layer1AttemptedForEntity = true;
-                geometry = getEntityGeometryFromReaderInternals(internalPageData, text, entity.start, entity.end, selectionRects);
+                geometry = getEntityGeometryFromReaderInternals(internalPageData, text, span.start, span.end, selectionRects);
                 if (!geometry) {
                     layer1EntityGeometryFailed = true;
-                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 1 attempted but entity geometry failed for "${entity.text}"`);
+                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 1 attempted but span geometry failed for "${span.text}"`);
                 }
             }
 
             if (!geometry && internalPageData) {
                 layer2AttemptedForEntity = true;
                 const fallbackSelectionMatch = await ensureLayer2SelectionMatch();
-                geometry = getEntityGeometryFromCharPositions(fallbackSelectionMatch, charPositions, text, entity.start, entity.end);
+                geometry = getEntityGeometryFromCharPositions(fallbackSelectionMatch, charPositions, text, span.start, span.end);
                 if (!geometry) {
                     layer2EntityGeometryFailed = true;
-                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 entity geometry failed for "${entity.text}"`);
+                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 span geometry failed for "${span.text}"`);
                 }
             } else if (!geometry) {
                 layer2AttemptedForEntity = true;
-                geometry = getEntityGeometryFromCharPositions(layer2SelectionMatch, charPositions, text, entity.start, entity.end);
+                geometry = getEntityGeometryFromCharPositions(layer2SelectionMatch, charPositions, text, span.start, span.end);
                 if (!geometry) {
                     layer2EntityGeometryFailed = true;
-                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 entity geometry failed for "${entity.text}"`);
+                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 span geometry failed for "${span.text}"`);
                 }
             }
 
-            const mergedRects = geometry?.rects ?? computeEntityRects(text, annotationBase.position?.rects ?? [], entity.start, entity.end);
+            const mergedRects = geometry?.rects ?? computeEntityRects(text, annotationBase.position?.rects ?? [], span.start, span.end);
 
             if (!mergedRects.length) continue;
 
             if (geometry) {
-                Zotero.debug(`[Zotero PDF Highlighter] Using layer ${geometry.layer} geometry for "${entity.text}"`);
+                Zotero.debug(`[Zotero PDF Highlighter] Using layer ${geometry.layer} geometry for "${span.text}"`);
             } else {
                 const layer3FallbackReason = geometryTimedOut
-                    ? 'selection geometry timed out before entity geometry resolved'
+                    ? 'selection geometry timed out before span geometry resolved'
                     : layer2AttemptedForEntity && layer2EntityGeometryFailed
                         ? layer1AttemptedForEntity && layer1EntityGeometryFailed
-                            ? 'layer 1 entity geometry failed and layer 2 entity geometry failed'
-                            : 'layer 2 entity geometry failed'
+                            ? 'layer 1 span geometry failed and layer 2 span geometry failed'
+                            : 'layer 2 span geometry failed'
                         : layer1AttemptedForEntity && layer1EntityGeometryFailed
-                            ? 'layer 1 entity geometry failed'
+                            ? 'layer 1 span geometry failed'
                             : popupGeometryDiagnostics.layer2SelectionMatchFailureReason
                                 || popupGeometryDiagnostics.layer1CharsUnavailableReason
                                 || 'precise popup geometry was unavailable';
-                Zotero.debug(`[Zotero PDF Highlighter] Popup final layer 3 fallback reason for "${entity.text}": ${layer3FallbackReason}`);
-                Zotero.debug(`[Zotero PDF Highlighter] Using layer 3 geometry for "${entity.text}"`);
+                Zotero.debug(`[Zotero PDF Highlighter] Popup final layer 3 fallback reason for "${span.text}": ${layer3FallbackReason}`);
+                Zotero.debug(`[Zotero PDF Highlighter] Using layer 3 geometry for "${span.text}"`);
             }
 
             const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
                 || Zotero.Utilities?.generateObjectKey?.()
-                || `ner_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                || `reading_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
             const annotationData = {
                 key: annotationKey,
                 type: 'highlight',
-                color: color,
-                text: entity.text,
-                comment: `[${entity.type}]`,
+                color: READING_HIGHLIGHT_COLOR,
+                text: span.text,
+                comment: span.reason ? `[${span.reason}]` : '',
                 position: {
                     pageIndex: pageIndex,
                     rects: mergedRects,
@@ -1414,18 +1478,20 @@ async function createNerHighlightsWithCharPositions(
                 pageLabel: annotationBase.pageLabel || String(pageIndex + 1),
                 sortIndex: geometry
                     ? getSortIndexForRects(pageIndex, geometry.sortIndexOffset, mergedRects)
-                    : getEntityFallbackSortIndex(annotationBase, pageIndex, entity.start, mergedRects),
+                    : getEntityFallbackSortIndex(annotationBase, pageIndex, span.start, mergedRects),
                 tags: [],
             };
 
-            // Primary: Use Zotero.Annotations.saveFromJSON (most reliable)
             if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
                 try {
-                    await saveAnnotationJsonToAttachment(attachment, annotationData);
-                    Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via saveFromJSON`);
-                    created++;
-                    refreshAnnotationView(internal);
-                    continue;  // Success, move to next entity
+                    if (await saveAnnotationJsonToAttachment(attachment, annotationData)) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via saveFromJSON`);
+                        created++;
+                        refreshAnnotationView(internal);
+                        continue;
+                    }
+
+                    Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON returned false for selection highlight "${span.text}"`);
                 } catch (saveErr: any) {
                     Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON failed: ${saveErr?.message}`);
                 }
@@ -1433,11 +1499,10 @@ async function createNerHighlightsWithCharPositions(
                 Zotero.debug(`[Zotero PDF Highlighter] CharPositions: Skipping saveFromJSON: attachment=${!!attachment}, saveFromJSON=${typeof Zotero.Annotations?.saveFromJSON}`);
             }
 
-            // Secondary fallback: Try annotation manager
             if (mgr && typeof mgr.addAnnotation === 'function') {
                 try {
                     if (await addAnnotationViaManager(reader, mgr, annotationData)) {
-                        Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via addAnnotation`);
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via addAnnotation`);
                         created++;
                         refreshAnnotationView(internal);
                         continue;
@@ -1447,16 +1512,16 @@ async function createNerHighlightsWithCharPositions(
                 }
             }
 
-            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${entity.text}"`);
+            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${span.text}"`);
         } catch (e: any) {
-            Zotero.debug(`[Zotero PDF Highlighter] CharPositions failed for "${entity.text}": ${e?.message}`);
+            Zotero.debug(`[Zotero PDF Highlighter] CharPositions failed for "${span.text}": ${e?.message}`);
         }
     }
 
     return created;
 }
 
-async function createNerHighlights(event: any, button: any): Promise<void> {
+async function createSelectionReadingHighlights(event: any, button: any): Promise<void> {
     const base = getSafeSelectionAnnotationSnapshot(event?.params?.annotation);
     if (!base?.position) {
         notifyHighlightFailure(event, button);
@@ -1471,8 +1536,8 @@ async function createNerHighlights(event: any, button: any): Promise<void> {
 
     const reader = event?.reader;
     const selectionRequestKey = getSelectionRequestKey(reader, base, selectedText);
-    if (selectionNerInFlight.has(selectionRequestKey)) {
-        Zotero.debug('[Zotero PDF Highlighter] Duplicate selection NER request ignored');
+    if (selectionHighlightInFlight.has(selectionRequestKey)) {
+        Zotero.debug('[Zotero PDF Highlighter] Duplicate selection reading-highlight request ignored');
         showTemporaryButtonState(button, event, '⏳ Already running', 1200);
         return;
     }
@@ -1484,59 +1549,59 @@ async function createNerHighlights(event: any, button: any): Promise<void> {
     }
 
     const requestPromise = (async () => {
-        setSelectionPopupProgress(button, 'extracting-entities');
+        setSelectionPopupProgress(button, 'analyzing-selection');
 
-        let entities: NerEntity[];
+        const selectionContext = await buildSelectionContext(reader, base, selectedText);
+        let spans: ReadingHighlightSpan[];
         try {
-            entities = await extractEntities(selectedText, {
+            const rawSpans = await extractSelectionHighlights({
+                selectionText: selectedText,
+                paperTitle: selectionContext.paperTitle,
+                sectionTitle: selectionContext.sectionTitle,
+                beforeContext: selectionContext.beforeContext,
+                afterContext: selectionContext.afterContext,
+            }, {
                 callerLabel: 'selection',
-                timeoutMs: SELECTION_NER_REQUEST_TIMEOUT_MS,
-                maxRetries: SELECTION_NER_REQUEST_ATTEMPTS,
+                timeoutMs: SELECTION_HIGHLIGHT_REQUEST_TIMEOUT_MS,
+                maxRetries: SELECTION_HIGHLIGHT_REQUEST_ATTEMPTS,
             });
+            spans = validateQuickHighlightSpans(rawSpans, selectedText);
         } catch (err: any) {
-            Zotero.debug(`[Zotero PDF Highlighter] NER extraction failed: ${err?.message || err}`);
-            const fallbackOk = await createFallbackHighlight(event);
-            if (fallbackOk) {
-                showTemporaryButtonState(button, event, '⚠️ Fallback (1)', 2000);
-            } else {
-                notifyHighlightFailure(event, button);
-            }
+            Zotero.debug(`[Zotero PDF Highlighter] Selection highlight extraction failed: ${err?.message || err}`);
+            showTemporaryButtonState(button, event, '∅ No highlight', 1800);
             return;
         }
 
-        if (entities.length === 0) {
-            Zotero.debug('[Zotero PDF Highlighter] NER returned 0 entities, using fallback');
-            const fallbackOk = await createFallbackHighlight(event);
-            if (fallbackOk) {
-                showTemporaryButtonState(button, event, '⚠️ No entities', 2000);
-            } else {
-                notifyHighlightFailure(event, button);
-            }
+        if (spans.length === 0) {
+            Zotero.debug('[Zotero PDF Highlighter] Selection mode returned no valid highlights');
+            showTemporaryButtonState(button, event, '∅ No highlight', 1800);
             return;
         }
 
-        Zotero.debug(`[Zotero PDF Highlighter] creating highlights for ${entities.length} entities`);
+        Zotero.debug(`[Zotero PDF Highlighter] creating highlights for ${spans.length} reading spans`);
 
-        const created = await createNerHighlightsWithCharPositions(
+        const created = await createSelectionHighlightsWithCharPositions(
             reader,
             base,
             selectedText,
-            entities,
+            spans,
             stage => setSelectionPopupProgress(button, stage)
         );
-        const failCount = entities.length - created;
+        const failCount = spans.length - created;
         if (failCount === 0) {
             showTemporaryButtonState(button, event, `✓ Done (${created})`, 2000);
+        } else if (created === 0) {
+            notifyHighlightFailure(event, button);
         } else {
             showTemporaryButtonState(button, event, `⚠️ ${created}ok/${failCount}err`, 2500);
         }
     })();
 
-    selectionNerInFlight.set(selectionRequestKey, requestPromise);
+    selectionHighlightInFlight.set(selectionRequestKey, requestPromise);
     try {
         await requestPromise;
     } finally {
-        selectionNerInFlight.delete(selectionRequestKey);
+        selectionHighlightInFlight.delete(selectionRequestKey);
     }
 }
 
@@ -2250,6 +2315,64 @@ function refreshAnnotationView(internal: any): void {
     }
 }
 
+async function createPaperHighlightAnnotation(
+    reader: any,
+    attachment: any,
+    pageIndex: number,
+    candidate: ReadingHighlightCandidate,
+    charPositions: CharPosition[]
+): Promise<boolean> {
+    const internal = reader?._internalReader || reader;
+    const geometry = getEntityGeometryFromCharPositions(
+        { mode: 'exact', rawStart: 0, rawOffsetBase: 0 },
+        charPositions,
+        charPositions.map(position => position.char).join(''),
+        candidate.start,
+        candidate.end
+    );
+    const mergedRects = geometry?.rects;
+    if (!mergedRects?.length) return false;
+
+    const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
+        || Zotero.Utilities?.generateObjectKey?.()
+        || `reading_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const annotationData = {
+        key: annotationKey,
+        type: 'highlight',
+        color: READING_HIGHLIGHT_COLOR,
+        text: candidate.text,
+        comment: candidate.sectionTitle ? `[${candidate.sectionTitle}]` : '',
+        position: {
+            pageIndex,
+            rects: mergedRects,
+        },
+        pageLabel: String(pageIndex + 1),
+        sortIndex: getSortIndexForRects(pageIndex, geometry!.sortIndexOffset, mergedRects),
+        tags: [],
+    };
+
+    if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
+        if (await saveAnnotationJsonToAttachment(attachment, annotationData)) {
+            refreshAnnotationView(internal);
+            return true;
+        }
+
+        Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON returned false for global highlight "${candidate.text}"`);
+    }
+
+    const mgr = internal?._annotationManager;
+    if (mgr && typeof mgr.addAnnotation === 'function') {
+        const added = await addAnnotationViaManager(reader, mgr, annotationData);
+        if (added) {
+            refreshAnnotationView(internal);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // ── Bootstrap lifecycle ──────────────────────────────────────────────
 
 export function install(data: BootstrapData, reason: number) {
@@ -2352,14 +2475,14 @@ export function startup(data: BootstrapData, reason: number) {
             pluginID: 'zotero-pdf-highlighter@memorushb.com',
             src: data.rootURI + 'content/preferences.xhtml',
             scripts: [data.rootURI + 'content/preferences.js'],
-            label: 'PDF Highlighter',
+            label: 'Reading Assistant',
         });
     }
 
     registeredHandler = (event: any) => {
         const { append, doc } = event;
         const button = doc.createElement('button');
-        button.textContent = '🔬 NER Highlight';
+        button.textContent = '✨ Quick Highlight';
         button.style.backgroundColor = '#1e1e1e';
         button.style.color = '#d4d4d4';
         button.style.border = '1px solid #333';
@@ -2368,44 +2491,45 @@ export function startup(data: BootstrapData, reason: number) {
         button.style.cursor = 'pointer';
 
         button.onclick = async () => {
-            await createNerHighlights(event, button);
+            await createSelectionReadingHighlights(event, button);
         };
 
         append(button);
     };
     Zotero.Reader.registerEventListener('renderTextSelectionPopup', registeredHandler, 'zotero-pdf-highlighter');
 
-    // Register toolbar button for whole-document NER (all pages)
+    // Register toolbar button for whole-document reading highlights.
     toolbarHandler = (event: any) => {
         const { append, doc, reader } = event;
         const button = doc.createElement('button');
         button.id = 'zotero-pdf-highlighter-toolbar-btn';
-        button.textContent = '🔬 NER';
-        button.title = 'Run NER highlighting on ALL pages';
+        button.textContent = '✨ Read';
+        button.title = 'Run sparse paper-wide reading highlights';
         button.style.cssText = 'background:#1e1e1e;color:#d4d4d4;border:1px solid #333;border-radius:3px;padding:2px 8px;cursor:pointer;font-size:12px;margin-left:4px;';
 
         button.onclick = async () => {
             button.disabled = true;
-            button.textContent = '⏳ Starting...';
+            button.textContent = '⏳ Reading...';
 
             try {
                 const internal = reader?._internalReader;
                 const attachment = getReaderAttachment(reader);
+                const paperTitle = getPaperTitle(reader);
 
-                // Get total page count
                 const pdfViewer = internal?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfViewer;
                 const totalPages = pdfViewer?.pagesCount || 1;
 
                 Zotero.debug(`[Zotero PDF Highlighter] Processing ${totalPages} pages`);
 
-                let totalCreated = 0;
+                const pageTexts: PaperPageText[] = [];
+                const pageCharPositions = new Map<number, CharPosition[]>();
 
                 for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
                     try {
                         button.textContent = `⏳ Page ${pageIdx + 1}/${totalPages}`;
 
                         const charPositions = await getCharPositionsForPage(internal, pageIdx, {
-                            includeSyntheticEOL: false,
+                            includeSyntheticEOL: true,
                         });
                         if (!charPositions.length) {
                             Zotero.debug(`[Zotero PDF Highlighter] Page ${pageIdx} geometry unavailable, skipping`);
@@ -2419,81 +2543,72 @@ export function startup(data: BootstrapData, reason: number) {
                             continue;
                         }
 
-                        Zotero.debug(`[Zotero PDF Highlighter] Page ${pageIdx} text length: ${pageText.length}`);
-
-                        // Call NER for this page
-                        const entities = await extractEntities(pageText, { callerLabel: 'toolbar' });
-                        if (!entities || entities.length === 0) {
-                            Zotero.debug(`[Zotero PDF Highlighter] No entities found on page ${pageIdx}`);
-                            continue;
-                        }
-
-                        Zotero.debug(`[Zotero PDF Highlighter] Found ${entities.length} entities on page ${pageIdx}`);
-
-                        // Create highlights for each entity
-                        for (const entity of entities) {
-                            try {
-                                const entityColor = colorForEntityType(entity.type) || '#ffd400';
-
-                                const geometry = getEntityGeometryFromCharPositions(
-                                    { mode: 'exact', rawStart: 0, rawOffsetBase: 0 },
-                                    charPositions,
-                                    pageText,
-                                    entity.start,
-                                    entity.end
-                                );
-                                const mergedRects = geometry?.rects;
-
-                                if (!mergedRects?.length) {
-                                    Zotero.debug(`[Zotero PDF Highlighter] No rects for "${entity.text}", skipping`);
-                                    continue;
-                                }
-
-                                const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
-                                    || Zotero.Utilities?.generateObjectKey?.()
-                                    || `ner_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-                                const annotationData = {
-                                    key: annotationKey,
-                                    type: 'highlight',
-                                    color: entityColor,
-                                    text: entity.text,
-                                    comment: `[${entity.type}]`,
-                                    position: {
-                                        pageIndex: pageIdx,
-                                        rects: mergedRects,
-                                    },
-                                    pageLabel: String(pageIdx + 1),
-                                    sortIndex: getSortIndexForRects(pageIdx, geometry!.sortIndexOffset, mergedRects),
-                                    tags: [],
-                                };
-
-                                // Try to create annotation
-                                if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
-                                    await saveAnnotationJsonToAttachment(attachment, annotationData);
-                                    totalCreated++;
-                                    // Refresh view after each highlight for live feedback
-                                    refreshAnnotationView(internal);
-                                    Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" on page ${pageIdx}`);
-                                }
-                            } catch (e: any) {
-                                Zotero.debug(`[Zotero PDF Highlighter] Failed to create highlight for "${entity.text}": ${e?.message}`);
-                            }
-                        }
-
+                        pageTexts.push({ pageIndex: pageIdx, text: pageText });
+                        pageCharPositions.set(pageIdx, charPositions);
                     } catch (pageErr: any) {
                         Zotero.debug(`[Zotero PDF Highlighter] Error processing page ${pageIdx}: ${pageErr?.message}`);
                     }
                 }
 
-                Zotero.debug(`[Zotero PDF Highlighter] Total highlights created: ${totalCreated}`);
-                button.textContent = `✓ ${totalCreated} entities`;
-                setTimeout(() => { button.textContent = '🔬 NER'; button.disabled = false; }, 3000);
+                const preparedSelection: PreparedGlobalHighlightSelection = prepareGlobalHighlightSelection(pageTexts);
+                if (!preparedSelection.shortlist.length) {
+                    button.textContent = '∅ No highlights';
+                    setTimeout(() => { button.textContent = '✨ Read'; button.disabled = false; }, 2500);
+                    return;
+                }
+
+                button.textContent = `⏳ Ranking ${preparedSelection.shortlist.length}`;
+
+                let selectedIds: string[] = [];
+                try {
+                    selectedIds = await selectGlobalHighlightCandidateIds(
+                        preparedSelection.shortlist,
+                        preparedSelection.maxHighlights,
+                        paperTitle,
+                        {
+                            callerLabel: 'toolbar',
+                            timeoutMs: GLOBAL_HIGHLIGHT_REQUEST_TIMEOUT_MS,
+                            maxRetries: GLOBAL_HIGHLIGHT_REQUEST_ATTEMPTS,
+                        }
+                    );
+                } catch (rankErr: any) {
+                    Zotero.debug(`[Zotero PDF Highlighter] Global ranking failed: ${rankErr?.message || rankErr}`);
+                }
+
+                if (!selectedIds.length) {
+                    selectedIds = preparedSelection.shortlist.map(candidate => candidate.id);
+                    Zotero.debug('[Zotero PDF Highlighter] Global ranking yielded no IDs; falling back to heuristic shortlist order');
+                }
+
+                const finalCandidates = finalizeGlobalHighlightSelection(preparedSelection, selectedIds);
+                if (!finalCandidates.length) {
+                    button.textContent = '∅ No highlights';
+                    setTimeout(() => { button.textContent = '✨ Read'; button.disabled = false; }, 2500);
+                    return;
+                }
+
+                let totalCreated = 0;
+                for (const candidate of finalCandidates) {
+                    const charPositions = pageCharPositions.get(candidate.pageIndex);
+                    if (!charPositions?.length) continue;
+
+                    button.textContent = `⏳ Highlight ${totalCreated + 1}/${finalCandidates.length}`;
+                    try {
+                        const created = await createPaperHighlightAnnotation(reader, attachment, candidate.pageIndex, candidate, charPositions);
+                        if (created) totalCreated++;
+                    } catch (candidateErr: any) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Failed to create global highlight for "${candidate.text}": ${candidateErr?.message || candidateErr}`);
+                    }
+                }
+
+                Zotero.debug(`[Zotero PDF Highlighter] Total reading highlights created: ${totalCreated}`);
+                button.textContent = totalCreated > 0 ? `✓ ${totalCreated} highlights` : '∅ No highlights';
+                setTimeout(() => { button.textContent = '✨ Read'; button.disabled = false; }, 3000);
 
             } catch (error: any) {
-                Zotero.debug(`[Zotero PDF Highlighter] Toolbar NER failed: ${error?.message || error}`);
+                Zotero.debug(`[Zotero PDF Highlighter] Toolbar reading pass failed: ${error?.message || error}`);
                 button.textContent = '❌ Error';
-                setTimeout(() => { button.textContent = '🔬 NER'; button.disabled = false; }, 2000);
+                setTimeout(() => { button.textContent = '✨ Read'; button.disabled = false; }, 2000);
             }
         };
 
@@ -2504,7 +2619,7 @@ export function startup(data: BootstrapData, reason: number) {
 
 export function shutdown(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero PDF Highlighter: shutdown");
-    selectionNerInFlight.clear();
+    selectionHighlightInFlight.clear();
 
     if (registeredHandler) {
         Zotero.Reader.unregisterEventListener('renderTextSelectionPopup', registeredHandler);

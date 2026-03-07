@@ -1,31 +1,39 @@
-/**
- * LLM API client for NER extraction.
- * Uses Zotero.HTTP.request() to bypass CookieSandbox header stripping.
- * Settings read from Zotero.Prefs at call time.
- */
-
 declare const Zotero: any;
 
 import { PREF_PREFIX, resolveSystemPromptPreference } from "./preferences";
-
-// ── Types ────────────────────────────────────────────────────────────
-
-export interface NerEntity {
-  text: string;
-  type: string;
-  start: number; // 0-based char offset
-  end: number;   // exclusive
-}
+import type { ReadingHighlightCandidate, ReadingHighlightSpan } from "./reading-highlights";
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
 }
 
-export interface ExtractEntitiesOptions {
+export interface LlmRequestOptions {
   timeoutMs?: number;
   maxRetries?: number;
   callerLabel?: string;
+}
+
+export interface SelectionHighlightPromptInput {
+  selectionText: string;
+  paperTitle?: string | null;
+  sectionTitle?: string | null;
+  beforeContext?: string;
+  afterContext?: string;
+}
+
+interface SelectionHighlightResponse {
+  highlights?: Array<{
+    text?: unknown;
+    start?: unknown;
+    end?: unknown;
+    reason?: unknown;
+    confidence?: unknown;
+  }>;
+}
+
+interface CandidateSelectionResponse {
+  selectedIds?: unknown;
 }
 
 interface LlmErrorClassification {
@@ -47,47 +55,50 @@ class NonRetryableLlmError extends Error {
   }
 }
 
-// ── Constants ────────────────────────────────────────────────────────
-
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
+const GLOBAL_CANDIDATE_HARD_LIMIT = 36;
 
-function getSystemPrompt(): string {
+function getQuickHighlightSystemPrompt(): string {
   return resolveSystemPromptPreference(getPref("systemPrompt"));
 }
 
-function getLogPrefix(callerLabel?: string): string {
-  return callerLabel ? `[NER:${callerLabel}]` : "[NER]";
+function getGlobalRankingSystemPrompt(): string {
+  return [
+    "You are selecting sparse, worth-reading highlights from an academic paper.",
+    "Return JSON only in the exact schema: {\"selectedIds\":[\"P1-C1\",\"P2-C3\"]}.",
+    "Choose only candidates that are self-contained, high-value, and short enough to highlight cleanly.",
+    "Prioritize: core contribution/claim, key results/evidence, decision-critical method details, caveats/limitations, problem framing/research gap.",
+    "Penalize: redundancy, boilerplate, citation-only content, figure/table-dependent lines, pronoun-heavy fragments, and long or diffuse spans.",
+    "High precision over recall. It is good to select fewer candidates than the budget.",
+    "Do not invent IDs. If none qualify, return {\"selectedIds\":[]}."
+  ].join(" ");
 }
 
-// ── Preference helpers ───────────────────────────────────────────────
+function getLogPrefix(callerLabel?: string): string {
+  return callerLabel ? `[Reading:${callerLabel}]` : "[Reading]";
+}
 
 function getPref(key: string): string {
   return String(Zotero.Prefs.get(PREF_PREFIX + key) ?? "");
 }
 
-// ── Error classification ─────────────────────────────────────────────
-
 function classifyHttpError(status: number): LlmErrorClassification {
   if (status === 429) return { kind: "rate_limit", retryable: true };
-  if (status >= 500)  return { kind: "server_error", retryable: true };
+  if (status >= 500) return { kind: "server_error", retryable: true };
   return { kind: "client_error", retryable: false };
 }
-
-// ── JSON extraction ──────────────────────────────────────────────────
 
 function cleanMarkdownCodeBlock(raw: string): string {
   let cleaned = raw.trim();
 
-  // Remove leading ```json or ```
   if (cleaned.startsWith("```json")) {
     cleaned = cleaned.slice(7);
   } else if (cleaned.startsWith("```")) {
     cleaned = cleaned.slice(3);
   }
 
-  // Remove trailing ```
   if (cleaned.endsWith("```")) {
     cleaned = cleaned.slice(0, -3);
   }
@@ -214,7 +225,6 @@ function extractSingletonArrayElement(input: string): string | null {
 }
 
 function extractJsonFromResponse(raw: string): string {
-  // Try raw parse first
   const trimmed = raw.trim();
   const balancedTrimmed = extractBalancedJsonPrefix(trimmed);
   if (balancedTrimmed) return balancedTrimmed;
@@ -224,9 +234,6 @@ function extractJsonFromResponse(raw: string): string {
 
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
 
-  // Strip markdown code fences (handles both block and inline formats)
-  // Inline: ```json {"entities":[...]}```
-  // Block: ```json\n{"entities":[...]}\n```
   const cleaned = cleanMarkdownCodeBlock(trimmed);
   const balancedCleaned = extractBalancedJsonPrefix(cleaned);
   if (balancedCleaned) return balancedCleaned;
@@ -236,7 +243,6 @@ function extractJsonFromResponse(raw: string): string {
 
   if (cleaned.startsWith("{") || cleaned.startsWith("[")) return cleaned;
 
-  // Fallback: regex for multi-line code blocks with extra text around them
   const fencePattern = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/;
   const fenceMatch = fencePattern.exec(trimmed);
   if (fenceMatch) {
@@ -246,7 +252,6 @@ function extractJsonFromResponse(raw: string): string {
       ?? fencedContent;
   }
 
-  // Last resort: find first { ... last }
   const firstBrace = trimmed.indexOf("{");
   const lastBrace = trimmed.lastIndexOf("}");
   if (firstBrace !== -1 && lastBrace > firstBrace) {
@@ -299,84 +304,7 @@ function extractMessageContent(responseJson: any): string {
   return "";
 }
 
-function describeParsedRootShape(value: unknown): "array" | "object" | "primitive" {
-  if (Array.isArray(value)) return "array";
-  if (value && typeof value === "object") return "object";
-  return "primitive";
-}
-
-function extractEntitiesArray(parsed: unknown): NerEntity[] | null {
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    const directEntities = (parsed as { entities?: unknown }).entities;
-    return Array.isArray(directEntities) ? directEntities as NerEntity[] : null;
-  }
-
-  if (!Array.isArray(parsed)) {
-    return null;
-  }
-
-  for (const item of parsed) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      continue;
-    }
-
-    const itemEntities = (item as { entities?: unknown }).entities;
-    if (Array.isArray(itemEntities)) {
-      return itemEntities as NerEntity[];
-    }
-  }
-
-  return null;
-}
-
-// ── Offset validation & repair ───────────────────────────────────────
-
-function validateAndRepairEntities(entities: NerEntity[], sourceText: string): NerEntity[] {
-  const validated: NerEntity[] = [];
-
-  for (const entity of entities) {
-    if (!entity.text || !entity.type || typeof entity.start !== "number" || typeof entity.end !== "number") {
-      continue;
-    }
-
-    const normalizedType = entity.type.toUpperCase();
-    const entityLen = entity.text.length;
-
-    // Strategy 1: exact match at declared offsets
-    const sliceAtOffset = sourceText.slice(entity.start, entity.end);
-    if (sliceAtOffset === entity.text) {
-      validated.push({ text: entity.text, type: normalizedType, start: entity.start, end: entity.end });
-      continue;
-    }
-
-    // Strategy 2: search nearby (±30 chars) for exact substring
-    const searchStart = Math.max(0, entity.start - 30);
-    const searchEnd = Math.min(sourceText.length, entity.end + 30);
-    const nearbyWindow = sourceText.slice(searchStart, searchEnd);
-    const nearbyIdx = nearbyWindow.indexOf(entity.text);
-    if (nearbyIdx !== -1) {
-      const repairedStart = searchStart + nearbyIdx;
-      validated.push({ text: entity.text, type: normalizedType, start: repairedStart, end: repairedStart + entityLen });
-      continue;
-    }
-
-    // Strategy 3: global search for first occurrence
-    const globalIdx = sourceText.indexOf(entity.text);
-    if (globalIdx !== -1) {
-      validated.push({ text: entity.text, type: normalizedType, start: globalIdx, end: globalIdx + entityLen });
-      continue;
-    }
-
-    // Discard: entity text not found in source
-    Zotero.debug(`[NER] discarding entity "${entity.text}" — not found in source text`);
-  }
-
-  return validated;
-}
-
-// ── Core API call with retry ─────────────────────────────────────────
-
-async function chatCompletion(messages: ChatMessage[], options: ExtractEntitiesOptions = {}): Promise<string> {
+async function chatCompletion(messages: ChatMessage[], options: LlmRequestOptions = {}): Promise<string> {
   const apiKey = getPref("apiKey");
   const baseURL = getPref("baseURL") || "https://openrouter.ai/api/v1";
   const model = getPref("model") || "z-ai/glm-4.5-air:free";
@@ -384,7 +312,7 @@ async function chatCompletion(messages: ChatMessage[], options: ExtractEntitiesO
   const maxRetries = options.maxRetries ?? MAX_RETRIES;
   const logPrefix = getLogPrefix(options.callerLabel);
 
-  Zotero.debug(`${logPrefix} API Key configured: ${apiKey ? 'yes' : 'no'}, length: ${apiKey?.length ?? 0}`);
+  Zotero.debug(`${logPrefix} API Key configured: ${apiKey ? "yes" : "no"}, length: ${apiKey?.length ?? 0}`);
   Zotero.debug(`${logPrefix} Using baseURL: ${baseURL}, model: ${model}`);
 
   const url = `${baseURL.replace(/\/+$/, "")}/chat/completions`;
@@ -402,14 +330,12 @@ async function chatCompletion(messages: ChatMessage[], options: ExtractEntitiesO
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      // Use Zotero.HTTP.request to bypass CookieSandbox which strips
-      // Authorization headers from regular fetch() calls.
       const xhr = await Zotero.HTTP.request("POST", url, {
         headers,
         body,
         responseType: "text",
         timeout: timeoutMs,
-        successCodes: false, // Handle non-2xx responses manually
+        successCodes: false,
       });
 
       const status = xhr.status;
@@ -424,7 +350,6 @@ async function chatCompletion(messages: ChatMessage[], options: ExtractEntitiesO
           throw new NonRetryableLlmError(lastError.message);
         }
 
-        // Exponential backoff with jitter before retry
         if (attempt < maxRetries - 1) {
           const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt) + Math.random() * 500;
           await new Promise(resolve => setTimeout(resolve, backoff));
@@ -460,7 +385,6 @@ async function chatCompletion(messages: ChatMessage[], options: ExtractEntitiesO
         throw err;
       }
 
-      // Backoff before retry (unless it's a non-retryable error we already threw)
       if (attempt < maxRetries - 1) {
         const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt) + Math.random() * 500;
         await new Promise(resolve => setTimeout(resolve, backoff));
@@ -471,37 +395,115 @@ async function chatCompletion(messages: ChatMessage[], options: ExtractEntitiesO
   throw lastError ?? new Error("LLM API failed after all retries");
 }
 
-// ── Public API ───────────────────────────────────────────────────────
-
-export async function extractEntities(text: string, options: ExtractEntitiesOptions = {}): Promise<NerEntity[]> {
-  if (!text.trim()) return [];
-
-  const systemPrompt = getSystemPrompt();
+async function requestJson<T>(messages: ChatMessage[], options: LlmRequestOptions = {}): Promise<T> {
+  const rawResponse = await chatCompletion(messages, options);
   const logPrefix = getLogPrefix(options.callerLabel);
-
-  const rawResponse = await chatCompletion([
-    { role: "system", content: systemPrompt },
-    { role: "user", content: text },
-  ], options);
-
   Zotero.debug(`${logPrefix} raw LLM response (${rawResponse.length} chars): ${rawResponse.slice(0, 300)}`);
 
   const jsonStr = extractJsonFromResponse(rawResponse);
   Zotero.debug(`${logPrefix} cleaned JSON (${jsonStr.length} chars): ${jsonStr.slice(0, 300)}`);
-  
-  let parsed: unknown;
+
   try {
-    parsed = JSON.parse(jsonStr);
+    return JSON.parse(jsonStr) as T;
   } catch (err: any) {
     throw new Error(`Failed to parse LLM JSON response. Raw: "${rawResponse.slice(0, 150)}" | Cleaned: "${jsonStr.slice(0, 150)}" | Error: ${err.message}`);
   }
+}
 
-  const rawEntities = extractEntitiesArray(parsed);
-  if (!Array.isArray(rawEntities)) {
-    throw new Error(`LLM response missing usable "entities" array (parsed root: ${describeParsedRootShape(parsed)})`);
+function coerceReadingHighlightSpans(response: SelectionHighlightResponse): ReadingHighlightSpan[] {
+  if (!Array.isArray(response?.highlights)) {
+    return [];
   }
 
-  const validated = validateAndRepairEntities(rawEntities, text);
-  Zotero.debug(`${logPrefix} extracted ${validated.length} valid entities from ${rawEntities.length} raw`);
-  return validated;
+  return response.highlights.flatMap((highlight): ReadingHighlightSpan[] => {
+    if (!highlight || typeof highlight !== "object") return [];
+    if (typeof highlight.start !== "number" || typeof highlight.end !== "number") return [];
+
+    return [{
+      text: typeof highlight.text === "string" ? highlight.text : "",
+      start: highlight.start,
+      end: highlight.end,
+      reason: typeof highlight.reason === "string" ? highlight.reason : undefined,
+      confidence: typeof highlight.confidence === "number" ? highlight.confidence : undefined,
+    }];
+  });
+}
+
+function coerceSelectedIds(response: CandidateSelectionResponse, validIds: Set<string>): string[] {
+  if (!Array.isArray(response?.selectedIds)) {
+    return [];
+  }
+
+  const orderedIds: string[] = [];
+  const seen = new Set<string>();
+  for (const value of response.selectedIds) {
+    if (typeof value !== "string") continue;
+    if (!validIds.has(value) || seen.has(value)) continue;
+    seen.add(value);
+    orderedIds.push(value);
+  }
+  return orderedIds;
+}
+
+function buildSelectionUserPrompt(input: SelectionHighlightPromptInput): string {
+  const parts = [
+    `paper_title: ${input.paperTitle?.trim() || "unknown"}`,
+    `section_title: ${input.sectionTitle?.trim() || "unknown"}`,
+    `before_context: ${input.beforeContext?.trim() || ""}`,
+    `selection_text: ${input.selectionText}`,
+    `after_context: ${input.afterContext?.trim() || ""}`,
+    "Task: return up to 2 short worth-reading spans from selection_text only.",
+    "Rules: spans must stay strictly inside selection_text, be self-contained, avoid long blocks, and may return none.",
+    "Return JSON only: {\"highlights\":[{\"text\":\"exact substring\",\"start\":0,\"end\":10,\"reason\":\"claim|result|method|caveat|problem\",\"confidence\":0.0}]}."
+  ];
+
+  return parts.join("\n");
+}
+
+function buildGlobalRankingUserPrompt(candidates: ReadingHighlightCandidate[], maxHighlights: number, paperTitle?: string | null): string {
+  const header = [
+    `paper_title: ${paperTitle?.trim() || "unknown"}`,
+    `selection_budget: up to ${maxHighlights}`,
+    "Choose the best sparse reading highlights from these candidates.",
+    "Prefer claims, results, decision-critical methods, limitations, and research gap statements.",
+    "Select fewer than the budget if precision is uncertain.",
+    "Candidates:"
+  ].join("\n");
+
+  const candidateLines = candidates
+    .slice(0, GLOBAL_CANDIDATE_HARD_LIMIT)
+    .map(candidate => `${candidate.id} | page=${candidate.pageIndex + 1} | section=${candidate.sectionTitle || candidate.sectionKind} | score=${candidate.heuristicScore} | text=${JSON.stringify(candidate.text)}`);
+
+  return `${header}\n${candidateLines.join("\n")}`;
+}
+
+export async function extractSelectionHighlights(
+  input: SelectionHighlightPromptInput,
+  options: LlmRequestOptions = {}
+): Promise<ReadingHighlightSpan[]> {
+  if (!input.selectionText.trim()) return [];
+
+  const parsed = await requestJson<SelectionHighlightResponse>([
+    { role: "system", content: getQuickHighlightSystemPrompt() },
+    { role: "user", content: buildSelectionUserPrompt(input) },
+  ], options);
+
+  return coerceReadingHighlightSpans(parsed);
+}
+
+export async function selectGlobalHighlightCandidateIds(
+  candidates: ReadingHighlightCandidate[],
+  maxHighlights: number,
+  paperTitle?: string | null,
+  options: LlmRequestOptions = {}
+): Promise<string[]> {
+  if (!candidates.length || maxHighlights <= 0) return [];
+
+  const validIds = new Set(candidates.map(candidate => candidate.id));
+  const parsed = await requestJson<CandidateSelectionResponse>([
+    { role: "system", content: getGlobalRankingSystemPrompt() },
+    { role: "user", content: buildGlobalRankingUserPrompt(candidates, maxHighlights, paperTitle) },
+  ], options);
+
+  return coerceSelectedIds(parsed, validIds);
 }

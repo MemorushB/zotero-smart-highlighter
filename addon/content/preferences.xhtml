@@ -5,7 +5,7 @@
   <!-- Script loaded via PreferencePanes.register scripts array for Zotero 8 compatibility -->
 
   <groupbox>
-    <label><html:h2>🔬 PDF Highlighter — LLM Settings</html:h2></label>
+    <label><html:h2>✨ Reading Assistant — LLM Settings</html:h2></label>
 
     <hbox align="center">
       <label value="API Key:" style="width: 80px;"/>
@@ -35,19 +35,19 @@
   </groupbox>
 
   <groupbox>
-    <label><html:strong data-l10n-id="pref-system-prompt-label">System Prompt</html:strong></label>
+    <label><html:strong data-l10n-id="pref-system-prompt-label">Quick Highlight Prompt Override</html:strong></label>
     <html:textarea id="pref-systemPrompt" rows="10" style="width: 100%; font-family: monospace; font-size: 12px;"/>
 
     <separator class="thin"/>
     <description style="font-size: 11px; color: #666;">
-      Leave this blank to use the built-in default prompt shown in the field. Any saved text here overrides the runtime system prompt exactly.
+      Leave this blank to use the built-in quick-highlight prompt shown in the field. Any saved text here overrides the selection-mode system prompt exactly.
     </description>
   </groupbox>
 
   <groupbox>
-    <label><html:h3>Entity Types &amp; Colors</html:h3></label>
+    <label><html:h3>Default Highlighting Behavior</html:h3></label>
     <description style="font-size: 11px;">
-      🔵 METHOD · 🟠 DATASET · 🔴 METRIC · 🟢 TASK · 🟡 PERSON · 🟣 MATERIAL · 💜 INSTITUTION · ⚪ TERM
+      Quick highlight stays inside the current selection. Toolbar highlighting runs a slower paper-wide pass that prefers sparse claim, result, method, caveat, and research-gap highlights.
     </description>
   </groupbox>
 </vbox>

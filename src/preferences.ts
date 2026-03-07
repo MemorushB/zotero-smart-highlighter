@@ -1,9 +1,8 @@
 export const PREF_PREFIX = 'extensions.zotero-pdf-highlighter.';
 
-export const DEFAULT_SYSTEM_PROMPT = `Extract academic named entities from the user text.
-Return JSON only in this exact schema: {"entities":[{"text":"exact text","type":"TYPE","start":0,"end":5}]}
-Allowed types: METHOD, DATASET, METRIC, TASK, PERSON, MATERIAL, INSTITUTION, TERM.
-Rules: no explanation, no reasoning, no markdown, no restating input, stop immediately after the closing }. If none, return {"entities":[]}.
+export const DEFAULT_SYSTEM_PROMPT = `You are a paper reading assistant for precise selection-only highlighting.
+Return JSON only in this exact schema: {"highlights":[{"text":"exact substring","start":0,"end":12,"reason":"claim|result|method|caveat|problem","confidence":0.0}]}
+Rules: use only text inside selection_text, keep spans short and self-contained, never highlight the whole selection unless it is genuinely short and precise, and prefer returning {"highlights":[]} when uncertain.
 Offsets: start is 0-based, end is exclusive, and text must be the exact substring at [start, end).`;
 
 export const PREF_DEFAULTS: Record<string, string> = {
