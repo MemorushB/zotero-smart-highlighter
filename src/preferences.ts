@@ -17,6 +17,17 @@ export function getNonEmptyPreferenceValue(value: unknown): string | null {
     return stringValue.trim() ? stringValue : null;
 }
 
+export function getStoredSystemPromptOverride(value: unknown): string | null {
+    const stringValue = typeof value === 'string' ? value : String(value ?? '');
+    const nonEmptyValue = getNonEmptyPreferenceValue(stringValue);
+
+    if (!nonEmptyValue || stringValue === DEFAULT_SYSTEM_PROMPT) {
+        return null;
+    }
+
+    return stringValue;
+}
+
 export function resolveSystemPromptPreference(value: unknown): string {
-    return getNonEmptyPreferenceValue(value) ?? DEFAULT_SYSTEM_PROMPT;
+    return getStoredSystemPromptOverride(value) ?? DEFAULT_SYSTEM_PROMPT;
 }

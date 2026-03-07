@@ -4,7 +4,7 @@ declare const cloneInto: ((value: any, targetScope: any, options?: any) => any) 
 import { extractEntities, type NerEntity } from "./llm";
 import { colorForEntityType } from "./entity-colors";
 import { computeEntityRects } from "./rect-splitter";
-import { PREF_DEFAULTS, PREF_PREFIX, getNonEmptyPreferenceValue, resolveSystemPromptPreference } from "./preferences";
+import { DEFAULT_SYSTEM_PROMPT, PREF_DEFAULTS, PREF_PREFIX, getStoredSystemPromptOverride } from "./preferences";
 
 export interface BootstrapData {
     id: string;
@@ -2300,19 +2300,27 @@ export function startup(data: BootstrapData, reason: number) {
                 // Load current value
                 const fullKey = PREF_PREFIX + prefKey;
                 const currentValue = prefKey === 'systemPrompt'
-                    ? resolveSystemPromptPreference(Zotero.Prefs.get(fullKey))
+                    ? (getStoredSystemPromptOverride(Zotero.Prefs.get(fullKey)) ?? '')
                     : String(Zotero.Prefs.get(fullKey) ?? '');
                 setPreferenceControlValue(input, currentValue);
+                if (prefKey === 'systemPrompt') {
+                    input.placeholder = DEFAULT_SYSTEM_PROMPT;
+                }
                 Zotero.debug(`[Zotero PDF Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
                 // Save on change
                 const saveHandler = () => {
                     try {
                         const value = input.value;
-                        const nonEmptyValue = getNonEmptyPreferenceValue(value);
-                        if (prefKey === 'systemPrompt' && !nonEmptyValue) {
-                            clearPreference(fullKey);
-                            setPreferenceControlValue(input, resolveSystemPromptPreference(undefined));
+                        if (prefKey === 'systemPrompt') {
+                            const storedOverride = getStoredSystemPromptOverride(value);
+
+                            if (!storedOverride) {
+                                clearPreference(fullKey);
+                                setPreferenceControlValue(input, '');
+                            } else {
+                                Zotero.Prefs.set(fullKey, storedOverride);
+                            }
                         } else {
                             Zotero.Prefs.set(fullKey, value);
                         }

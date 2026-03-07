@@ -6,7 +6,7 @@
 
 declare const Zotero: any;
 
-import { DEFAULT_SYSTEM_PROMPT, PREF_PREFIX, getNonEmptyPreferenceValue } from "./preferences";
+import { PREF_PREFIX, resolveSystemPromptPreference } from "./preferences";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
 
 function getSystemPrompt(): string {
-  return getNonEmptyPreferenceValue(getPref("systemPrompt")) ?? DEFAULT_SYSTEM_PROMPT;
+  return resolveSystemPromptPreference(getPref("systemPrompt"));
 }
 
 function getLogPrefix(callerLabel?: string): string {
