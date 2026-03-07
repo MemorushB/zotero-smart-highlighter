@@ -6,6 +6,8 @@
 
 declare const Zotero: any;
 
+import { DEFAULT_SYSTEM_PROMPT, PREF_PREFIX, getNonEmptyPreferenceValue } from "./preferences";
+
 // ── Types ────────────────────────────────────────────────────────────
 
 export interface NerEntity {
@@ -47,20 +49,12 @@ class NonRetryableLlmError extends Error {
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const PREF_PREFIX = "extensions.zotero-pdf-highlighter.";
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
 
-const DEFAULT_SYSTEM_PROMPT = `Extract academic named entities from the user text.
-Return JSON only in this exact schema: {"entities":[{"text":"exact text","type":"TYPE","start":0,"end":5}]}
-Allowed types: METHOD, DATASET, METRIC, TASK, PERSON, MATERIAL, INSTITUTION, TERM.
-Rules: no explanation, no reasoning, no markdown, no restating input, stop immediately after the closing }. If none, return {"entities":[]}.
-Offsets: start is 0-based, end is exclusive, and text must be the exact substring at [start, end).`;
-
 function getSystemPrompt(): string {
-  const customPrompt = getPref("systemPrompt");
-  return customPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
+  return getNonEmptyPreferenceValue(getPref("systemPrompt")) ?? DEFAULT_SYSTEM_PROMPT;
 }
 
 function getLogPrefix(callerLabel?: string): string {

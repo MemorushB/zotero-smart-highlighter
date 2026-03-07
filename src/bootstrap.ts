@@ -4,6 +4,7 @@ declare const cloneInto: ((value: any, targetScope: any, options?: any) => any) 
 import { extractEntities, type NerEntity } from "./llm";
 import { colorForEntityType } from "./entity-colors";
 import { computeEntityRects } from "./rect-splitter";
+import { PREF_DEFAULTS, PREF_PREFIX, getNonEmptyPreferenceValue, resolveSystemPromptPreference } from "./preferences";
 
 export interface BootstrapData {
     id: string;
@@ -27,6 +28,17 @@ const MATCH_SPACE_CHARACTERS = /[\s\u00A0\u1680\u180E\u2000-\u200A\u2028\u2029\u
 const MATCH_ZERO_WIDTH_CHARACTERS = /[\u200B\u200C\u200D\u2060\uFEFF]/u;
 const MATCH_OPENING_PUNCTUATION = new Set(['(', '[', '{']);
 const MATCH_TIGHT_LEADING_PUNCTUATION = new Set([')', ']', '}', ',', '.', ';', ':', '!', '?']);
+
+type PreferenceControl = HTMLInputElement | HTMLTextAreaElement;
+
+function setPreferenceControlValue(control: PreferenceControl, value: string): void {
+    control.value = value;
+
+    if (control.localName === 'textarea') {
+        control.defaultValue = value;
+        control.textContent = value;
+    }
+}
 
 interface AsyncTimeoutOptions {
     timeoutMs?: number;
@@ -130,14 +142,6 @@ type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => voi
 
 // ── Preferences ──────────────────────────────────────────────────────
 
-const PREF_PREFIX = 'extensions.zotero-pdf-highlighter.';
-
-const PREF_DEFAULTS: Record<string, string> = {
-    apiKey:  '',
-    baseURL: 'https://openrouter.ai/api/v1',
-    model:   'z-ai/glm-4.5-air:free',
-};
-
 function registerPreferenceDefaults(): void {
     for (const [key, val] of Object.entries(PREF_DEFAULTS)) {
         if (Zotero.Prefs.get(PREF_PREFIX + key) === undefined) {
@@ -165,6 +169,17 @@ function showTemporaryButtonState(button: any, event: any, text: string, duratio
     }
 
     setButtonState(button, '🔬 NER Highlight', false);
+}
+
+function clearPreference(prefKey: string): void {
+    const isFullyQualifiedKey = prefKey.startsWith(PREF_PREFIX);
+
+    if (typeof Zotero.Prefs.clear === 'function') {
+        Zotero.Prefs.clear(prefKey, isFullyQualifiedKey);
+        return;
+    }
+
+    Zotero.Prefs.set(prefKey, '', isFullyQualifiedKey);
 }
 
 function getSelectionPopupProgressText(stage: SelectionPopupProgressStage): string {
@@ -2277,22 +2292,30 @@ export function startup(data: BootstrapData, reason: number) {
             const handlers: Array<{ el: Element; type: string; fn: () => void }> = [];
 
             for (const [inputId, prefKey] of Object.entries(inputs)) {
-                const input = doc.getElementById(inputId) as HTMLInputElement | null;
+                const input = doc.getElementById(inputId) as PreferenceControl | null;
                 Zotero.debug(`[Zotero PDF Highlighter] Input ${inputId}: ${!!input}`);
 
                 if (!input) continue;
 
                 // Load current value
                 const fullKey = PREF_PREFIX + prefKey;
-                const currentValue = Zotero.Prefs.get(fullKey) ?? '';
-                input.value = currentValue;
+                const currentValue = prefKey === 'systemPrompt'
+                    ? resolveSystemPromptPreference(Zotero.Prefs.get(fullKey))
+                    : String(Zotero.Prefs.get(fullKey) ?? '');
+                setPreferenceControlValue(input, currentValue);
                 Zotero.debug(`[Zotero PDF Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
                 // Save on change
                 const saveHandler = () => {
                     try {
                         const value = input.value;
-                        Zotero.Prefs.set(fullKey, value);
+                        const nonEmptyValue = getNonEmptyPreferenceValue(value);
+                        if (prefKey === 'systemPrompt' && !nonEmptyValue) {
+                            clearPreference(fullKey);
+                            setPreferenceControlValue(input, resolveSystemPromptPreference(undefined));
+                        } else {
+                            Zotero.Prefs.set(fullKey, value);
+                        }
                         Zotero.debug(`[Zotero PDF Highlighter] Saved ${fullKey}`);
                     } catch (e) {
                         Zotero.debug(`[Zotero PDF Highlighter] Error saving ${fullKey}: ${e}`);
