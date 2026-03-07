@@ -58,7 +58,6 @@ function setPreferenceControlValue(control: PreferenceControl, value: string): v
 
     if (control instanceof HTMLTextAreaElement) {
         control.defaultValue = value;
-        control.textContent = value;
     }
 }
 
