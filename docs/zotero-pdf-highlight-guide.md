@@ -1,12 +1,12 @@
 # Zotero 插件开发：PDF 精确字符高亮指南
 
 > **调研日期**：2026-03-06  
-> **适用版本**：Zotero 8.x（基于本地 vendored 源码分析）  
+> **适用版本**：Zotero 8.x（基于本地 gitlink 引用仓库与上游源码分析）  
 > **源码参考**：
 > - [zotero/zotero `chrome/content/zotero/xpcom/reader.js`](https://github.com/zotero/zotero/blob/ce11d5295c461ed7e5ef4dacb00d06c4c2bc107f/chrome/content/zotero/xpcom/reader.js)
 > - [zotero/reader `src/pdf/selection.js`](https://github.com/zotero/reader/blob/87e5c7f5972da43b35939d3585f9585bfe7e132d/src/pdf/selection.js)
 > - [zotero/reader `src/pdf/lib/utilities.js`](https://github.com/zotero/reader/blob/87e5c7f5972da43b35939d3585f9585bfe7e132d/src/pdf/lib/utilities.js)
-> - 本地 vendored `zotero/reader` commit `fae5ba4`（reader 内部实现校验）
+> - 本地 gitlink 引用仓库 `zotero/reader` commit `fae5ba4`（reader 内部实现校验）
 >
 > **注意**：本文档已基于 Zotero 8 reader 源码（`zotero/reader` commit `fae5ba4`）校验更新
 

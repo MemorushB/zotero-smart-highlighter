@@ -2,7 +2,7 @@
 
 ## Repository overview and scope
 
-- This repository is a Zotero 7 plugin named `zotero-pdf-highlighter`.
+- This repository is a Zotero 8 plugin named `zotero-pdf-highlighter`.
 - The plugin adds named-entity-based PDF highlighting on top of Zotero's reader UI.
 - Root plugin code lives in `src/` and is authored in strict TypeScript.
 - Packaged plugin assets live in `addon/`, including bootstrap glue, manifest, locale files, and preferences assets.
@@ -14,7 +14,7 @@
   - preference pane registration through `Zotero.PreferencePanes.register`
   - reader popup integration through `renderTextSelectionPopup`
   - reader toolbar integration through `renderToolbar`
-- `zotero/` is a vendored upstream Zotero subtree with its own build, lint, test, and style rules.
+- `zotero/` is a gitlink-pinned upstream Zotero reference repo with its own build, lint, test, and style rules.
 - Treat root plugin work and `zotero/` work as separate environments.
 
 ## Setup and environment
@@ -53,7 +53,7 @@
 - If a change touches only `src/` or `addon/`, the safest default verification is `npm run build`.
 - If you need finer-grained verification at the root, `npx tsc --noEmit` is supported; single-file TS checks are not documented here.
 - Do not imply that a hidden Jest, Vitest, Mocha, or ESLint workflow exists at the root without direct evidence.
-- Single-test execution is only documented for the vendored `zotero/` subtree, not for the plugin root.
+- Single-test execution is only documented for the gitlink-pinned `zotero/` reference repo, not for the plugin root.
 
 ## Root code style guidelines
 
@@ -92,9 +92,9 @@
 - Preferences-related packaged assets live under `addon/` and are loaded through the plugin bootstrap/registration flow.
 - If you add new files at the root, place them according to current structure rather than creating new top-level buckets casually.
 
-## Vendored `zotero/` subtree guidance
+## Gitlink `zotero/` reference repo guidance
 
-- `zotero/` is not governed by the root plugin's TypeScript conventions.
+- `zotero/` is a separately sourced gitlink reference repo and is not governed by the root plugin's TypeScript conventions.
 - Read `zotero/CLAUDE.md` before making substantial edits inside `zotero/`.
 - `zotero/package.json` has its own build scripts, including `npm run build` and `npm run clean-build`.
 - `zotero/eslint.config.mjs` exists.
