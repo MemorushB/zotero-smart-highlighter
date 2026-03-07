@@ -1,6 +1,6 @@
 declare const Zotero: any;
 
-import { PREF_PREFIX, resolveSystemPromptPreference } from "./preferences";
+import { DEFAULT_GLOBAL_SYSTEM_PROMPT, PREF_PREFIX, getNonEmptyPreferenceValue, resolveSystemPromptPreference } from "./preferences";
 import type { ReadingHighlightCandidate, ReadingHighlightSpan } from "./reading-highlights";
 
 interface ChatMessage {
@@ -58,22 +58,31 @@ class NonRetryableLlmError extends Error {
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
-const GLOBAL_CANDIDATE_HARD_LIMIT = 36;
+const GLOBAL_CANDIDATE_HARD_LIMIT = 150;
 
 function getQuickHighlightSystemPrompt(): string {
   return resolveSystemPromptPreference(getPref("systemPrompt"));
 }
 
-function getGlobalRankingSystemPrompt(): string {
-  return [
-    "You are selecting sparse, worth-reading highlights from an academic paper.",
-    "Return JSON only in the exact schema: {\"selectedIds\":[\"P1-C1\",\"P2-C3\"]}.",
-    "Choose only candidates that are self-contained, high-value, and short enough to highlight cleanly.",
-    "Prioritize: core contribution/claim, key results/evidence, decision-critical method details, caveats/limitations, problem framing/research gap.",
-    "Penalize: redundancy, boilerplate, citation-only content, figure/table-dependent lines, pronoun-heavy fragments, and long or diffuse spans.",
-    "High precision over recall. It is good to select fewer candidates than the budget.",
-    "Do not invent IDs. If none qualify, return {\"selectedIds\":[]}."
-  ].join(" ");
+function getGlobalRankingSystemPrompt(focusMode: string = 'balanced'): string {
+  const storedOverride = getNonEmptyPreferenceValue(getPref("globalSystemPrompt"));
+  if (storedOverride && storedOverride !== DEFAULT_GLOBAL_SYSTEM_PROMPT) {
+    return storedOverride;
+  }
+
+  const basePrompt = [DEFAULT_GLOBAL_SYSTEM_PROMPT];
+
+  const focusGuidance: Record<string, string> = {
+    'results-first': 'Give extra weight to results, evidence, and quantitative outcomes.',
+    'methods-first': 'Give extra weight to method details, design decisions, and technical contributions.',
+    'caveats-first': 'Give extra weight to limitations, caveats, failure cases, and scope boundaries.',
+  };
+
+  if (focusGuidance[focusMode]) {
+    basePrompt.push(focusGuidance[focusMode]);
+  }
+
+  return basePrompt.join(" ");
 }
 
 function getLogPrefix(callerLabel?: string): string {
@@ -445,14 +454,14 @@ function coerceSelectedIds(response: CandidateSelectionResponse, validIds: Set<s
   return orderedIds;
 }
 
-function buildSelectionUserPrompt(input: SelectionHighlightPromptInput): string {
+function buildSelectionUserPrompt(input: SelectionHighlightPromptInput, maxHighlights: number = 3): string {
   const parts = [
     `paper_title: ${input.paperTitle?.trim() || "unknown"}`,
     `section_title: ${input.sectionTitle?.trim() || "unknown"}`,
     `before_context: ${input.beforeContext?.trim() || ""}`,
     `selection_text: ${input.selectionText}`,
     `after_context: ${input.afterContext?.trim() || ""}`,
-    "Task: return up to 2 short worth-reading spans from selection_text only.",
+    `Task: return up to ${maxHighlights} short worth-reading spans from selection_text only.`,
     "Rules: spans must stay strictly inside selection_text, be self-contained, avoid long blocks, and may return none.",
     "Return JSON only: {\"highlights\":[{\"text\":\"exact substring\",\"start\":0,\"end\":10,\"reason\":\"claim|result|method|caveat|problem\",\"confidence\":0.0}]}."
   ];
@@ -479,13 +488,14 @@ function buildGlobalRankingUserPrompt(candidates: ReadingHighlightCandidate[], m
 
 export async function extractSelectionHighlights(
   input: SelectionHighlightPromptInput,
-  options: LlmRequestOptions = {}
+  options: LlmRequestOptions = {},
+  maxHighlights: number = 3
 ): Promise<ReadingHighlightSpan[]> {
   if (!input.selectionText.trim()) return [];
 
   const parsed = await requestJson<SelectionHighlightResponse>([
     { role: "system", content: getQuickHighlightSystemPrompt() },
-    { role: "user", content: buildSelectionUserPrompt(input) },
+    { role: "user", content: buildSelectionUserPrompt(input, maxHighlights) },
   ], options);
 
   return coerceReadingHighlightSpans(parsed);
@@ -495,13 +505,14 @@ export async function selectGlobalHighlightCandidateIds(
   candidates: ReadingHighlightCandidate[],
   maxHighlights: number,
   paperTitle?: string | null,
-  options: LlmRequestOptions = {}
+  options: LlmRequestOptions = {},
+  focusMode: string = 'balanced'
 ): Promise<string[]> {
   if (!candidates.length || maxHighlights <= 0) return [];
 
   const validIds = new Set(candidates.map(candidate => candidate.id));
   const parsed = await requestJson<CandidateSelectionResponse>([
-    { role: "system", content: getGlobalRankingSystemPrompt() },
+    { role: "system", content: getGlobalRankingSystemPrompt(focusMode) },
     { role: "user", content: buildGlobalRankingUserPrompt(candidates, maxHighlights, paperTitle) },
   ], options);
 

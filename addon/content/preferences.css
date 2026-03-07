@@ -1,0 +1,89 @@
+/* Smart Highlight Preferences */
+.pref-container {
+    padding: 0 4px;
+}
+
+.pref-row {
+    display: flex;
+    align-items: center;
+    margin: 6px 0;
+    gap: 8px;
+}
+
+.pref-label {
+    width: 120px;
+    flex-shrink: 0;
+    font-size: 13px;
+}
+
+.pref-sublabel {
+    display: block;
+    font-weight: 600;
+    font-size: 13px;
+    margin: 8px 0 4px;
+}
+
+.pref-select {
+    flex: 1;
+    padding: 3px 6px;
+    font-size: 12px;
+}
+
+.pref-input {
+    flex: 1;
+    padding: 3px 6px;
+    font-size: 12px;
+}
+
+.pref-input-short {
+    width: 80px;
+    padding: 3px 6px;
+    font-size: 12px;
+}
+
+.pref-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 6px;
+}
+
+.pref-hint {
+    font-size: 11px;
+    color: #666;
+    margin: 4px 0 12px;
+}
+
+.pref-inline-hint {
+    font-size: 11px;
+    color: #888;
+    margin-left: 4px;
+    white-space: nowrap;
+}
+
+.advanced-section {
+    margin-top: 12px;
+}
+
+.advanced-toggle {
+    cursor: pointer;
+    font-weight: bold;
+    font-size: 13px;
+    padding: 6px 0;
+    user-select: none;
+}
+
+.advanced-toggle:hover {
+    opacity: 0.7;
+}
+
+@media (prefers-color-scheme: dark) {
+    .pref-hint {
+        color: #999;
+    }
+
+    .pref-inline-hint {
+        color: #aaa;
+    }
+}

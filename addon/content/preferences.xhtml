@@ -2,52 +2,72 @@
       xmlns:html="http://www.w3.org/1999/xhtml"
       onload="Zotero.ZoteroPDFHighlighter.hooks.onPrefsLoad(event)">
 
-  <!-- Script loaded via PreferencePanes.register scripts array for Zotero 8 compatibility -->
+  <html:link rel="stylesheet" href="chrome://zotero-pdf-highlighter/content/preferences.css"/>
 
-  <groupbox>
-    <label><html:h2>✨ Reading Assistant — LLM Settings</html:h2></label>
+  <html:div class="pref-container">
+    <html:h2 data-l10n-id="pref-title">Smart Highlight</html:h2>
 
-    <hbox align="center">
-      <label value="API Key:" style="width: 80px;"/>
-      <html:input type="password"
-                  id="pref-apiKey"
-                  preference="extensions.zotero-pdf-highlighter.apiKey"
-                  style="flex: 1;"/>
-    </hbox>
+    <html:div class="pref-row">
+      <html:label data-l10n-id="pref-density-label" class="pref-label">Highlight Density:</html:label>
+      <html:select id="pref-density" class="pref-select">
+        <html:option value="sparse">Sparse - fewer, high-confidence highlights</html:option>
+        <html:option value="balanced" selected="selected">Balanced - moderate coverage</html:option>
+        <html:option value="dense">Dense - comprehensive highlights</html:option>
+      </html:select>
+    </html:div>
 
-    <hbox align="center">
-      <label value="Base URL:" style="width: 80px;"/>
-      <html:input type="text"
-                  id="pref-baseURL"
-                  preference="extensions.zotero-pdf-highlighter.baseURL"
-                  style="flex: 1;"/>
-    </hbox>
+    <html:div class="pref-row">
+      <html:label data-l10n-id="pref-focus-label" class="pref-label">Reading Focus:</html:label>
+      <html:select id="pref-focusMode" class="pref-select">
+        <html:option value="balanced" selected="selected">Balanced</html:option>
+        <html:option value="results-first">Results &amp; Evidence</html:option>
+        <html:option value="methods-first">Methods &amp; Design</html:option>
+        <html:option value="caveats-first">Caveats &amp; Limitations</html:option>
+      </html:select>
+    </html:div>
 
-    <hbox align="center">
-      <label value="Model:" style="width: 80px;"/>
-      <html:input type="text"
-                  id="pref-model"
-                  preference="extensions.zotero-pdf-highlighter.model"
-                  style="flex: 1;"/>
-    </hbox>
+    <html:p data-l10n-id="pref-main-hint" class="pref-hint">Density controls how many highlights are created. Focus adjusts which sections are prioritized.</html:p>
 
-    <separator class="thin"/>
-  </groupbox>
+    <html:div class="advanced-section">
+      <html:div id="advanced-toggle" class="advanced-toggle"
+                onclick="var content = document.getElementById('advanced-content'); if (!content) { for (var f of document.querySelectorAll('iframe')) { try { content = f.contentDocument.getElementById('advanced-content'); } catch(e){} } } if (content) { var hidden = content.style.display === 'none'; content.style.display = hidden ? '' : 'none'; this.textContent = hidden ? '\u25BC Advanced Settings' : '\u25B6 Advanced Settings'; }">&#x25B6; Advanced Settings</html:div>
 
-  <groupbox>
-    <label><html:strong data-l10n-id="pref-system-prompt-label">Quick Highlight Prompt Override</html:strong></label>
-    <html:textarea id="pref-systemPrompt" rows="10" style="width: 100%; font-family: monospace; font-size: 12px;"/>
+      <html:div id="advanced-content" style="display:none;">
+        <html:h3 data-l10n-id="pref-api-section">LLM Connection</html:h3>
 
-    <separator class="thin"/>
-    <description style="font-size: 11px; color: #666;">
-      Leave this blank to use the built-in quick-highlight prompt shown in the field. Any saved text here overrides the selection-mode system prompt exactly.
-    </description>
-  </groupbox>
+        <html:div class="pref-row">
+          <html:label data-l10n-id="pref-api-key" class="pref-label">API Key:</html:label>
+          <html:input type="password" id="pref-apiKey" class="pref-input"/>
+        </html:div>
 
-  <groupbox>
-    <label><html:h3>Default Highlighting Behavior</html:h3></label>
-    <description style="font-size: 11px;">
-      Quick highlight stays inside the current selection. Toolbar highlighting runs a slower paper-wide pass that prefers sparse claim, result, method, caveat, and research-gap highlights.
-    </description>
-  </groupbox>
+        <html:div class="pref-row">
+          <html:label data-l10n-id="pref-base-url" class="pref-label">Base URL:</html:label>
+          <html:input type="text" id="pref-baseURL" class="pref-input" placeholder="https://openrouter.ai/api/v1"/>
+        </html:div>
+
+        <html:div class="pref-row">
+          <html:label data-l10n-id="pref-model" class="pref-label">Model:</html:label>
+          <html:input type="text" id="pref-model" class="pref-input" placeholder="z-ai/glm-4.5-air:free"/>
+        </html:div>
+
+        <html:h3 data-l10n-id="pref-prompt-section">Prompt Overrides</html:h3>
+
+        <html:label data-l10n-id="pref-system-prompt-label" class="pref-sublabel">Selection Highlight Prompt Override</html:label>
+        <html:textarea id="pref-systemPrompt" rows="6" class="pref-textarea" placeholder="Built-in: paper reading assistant for selection-only highlighting. Returns JSON with highlights array containing text, start, end, reason, confidence."></html:textarea>
+        <html:p data-l10n-id="pref-prompt-hint" class="pref-hint">Leave blank to use the built-in prompt. Any text here overrides the selection-mode system prompt.</html:p>
+
+        <html:label data-l10n-id="pref-global-prompt-label" class="pref-sublabel">Full-Paper Highlight Prompt Override</html:label>
+        <html:textarea id="pref-globalSystemPrompt" rows="6" class="pref-textarea" placeholder="Built-in: selects sparse, worth-reading highlights from academic papers. Returns JSON with selectedIds array. Adjusts based on Reading Focus setting."></html:textarea>
+        <html:p data-l10n-id="pref-global-prompt-hint" class="pref-hint">Leave blank to use the built-in prompt. Any text here overrides the full-paper highlighting system prompt.</html:p>
+
+        <html:h3 data-l10n-id="pref-quality-section">Quality Control</html:h3>
+
+        <html:div class="pref-row">
+          <html:label data-l10n-id="pref-min-confidence-label" class="pref-label">Min Confidence:</html:label>
+          <html:input type="number" id="pref-minConfidence" min="0" max="1" step="0.1" class="pref-input-short"/>
+          <html:span data-l10n-id="pref-min-confidence-hint" class="pref-inline-hint">0.0 (keep all) - 1.0 (strict)</html:span>
+        </html:div>
+      </html:div>
+    </html:div>
+  </html:div>
 </vbox>

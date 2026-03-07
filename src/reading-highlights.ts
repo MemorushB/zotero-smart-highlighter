@@ -1,3 +1,5 @@
+import { type DensityLevel, type FocusMode } from './preferences';
+
 export interface ReadingHighlightSpan {
     text: string;
     start: number;
@@ -44,26 +46,94 @@ export interface PreparedGlobalHighlightSelection {
     maxPerPage: number;
 }
 
-const QUICK_MIN_CHARS = 16;
-const QUICK_MAX_CHARS = 140;
-const QUICK_MAX_WORDS = 24;
-const QUICK_MAX_HIGHLIGHTS = 2;
+// ── Density-driven configuration ─────────────────────────────────────
 
-const GLOBAL_MIN_CHARS = 24;
-const GLOBAL_MAX_CHARS = 220;
-const GLOBAL_MAX_WORDS = 36;
-const GLOBAL_SHORTLIST_SIZE = 36;
+export interface DensityConfig {
+    quickMinChars: number;
+    quickMaxChars: number;
+    quickMaxWords: number;
+    quickMaxHighlights: number;
+    globalMinChars: number;
+    globalMaxChars: number;
+    globalMaxWords: number;
+    globalShortlistSize: number;
+    globalMaxHighlightsFormula: (pages: number) => number;
+    globalMaxPerPage: number;
+    shortlistPerPageCap: number;
+}
 
-const SECTION_WEIGHT: Record<ReadingSectionKind, number> = {
-    abstract: 4,
-    introduction: 3,
-    'related-work': 1,
-    methods: 2,
-    results: 5,
-    discussion: 4,
-    conclusion: 3,
-    other: 2,
+const DENSITY_CONFIGS: Record<DensityLevel, DensityConfig> = {
+    sparse: {
+        quickMinChars: 16,
+        quickMaxChars: 140,
+        quickMaxWords: 24,
+        quickMaxHighlights: 2,
+        globalMinChars: 20,
+        globalMaxChars: 220,
+        globalMaxWords: 36,
+        globalShortlistSize: 60,
+        globalMaxHighlightsFormula: (pages) => Math.min(50, Math.max(10, Math.ceil(pages * 3))),
+        globalMaxPerPage: 5,
+        shortlistPerPageCap: 6,
+    },
+    balanced: {
+        quickMinChars: 16,
+        quickMaxChars: 160,
+        quickMaxWords: 28,
+        quickMaxHighlights: 3,
+        globalMinChars: 18,
+        globalMaxChars: 240,
+        globalMaxWords: 40,
+        globalShortlistSize: 100,
+        globalMaxHighlightsFormula: (pages) => Math.min(100, Math.max(20, Math.ceil(pages * 6))),
+        globalMaxPerPage: 10,
+        shortlistPerPageCap: 12,
+    },
+    dense: {
+        quickMinChars: 14,
+        quickMaxChars: 180,
+        quickMaxWords: 32,
+        quickMaxHighlights: 5,
+        globalMinChars: 16,
+        globalMaxChars: 260,
+        globalMaxWords: 44,
+        globalShortlistSize: 150,
+        globalMaxHighlightsFormula: (pages) => Math.min(150, Math.max(30, Math.ceil(pages * 10))),
+        globalMaxPerPage: 15,
+        shortlistPerPageCap: 18,
+    },
 };
+
+export function getDensityConfig(density: string): DensityConfig {
+    return DENSITY_CONFIGS[density as DensityLevel] ?? DENSITY_CONFIGS.balanced;
+}
+
+// ── Focus-mode section weights ───────────────────────────────────────
+
+const FOCUS_SECTION_WEIGHTS: Record<FocusMode, Record<ReadingSectionKind, number>> = {
+    balanced: {
+        abstract: 4, introduction: 3, 'related-work': 1, methods: 2,
+        results: 5, discussion: 4, conclusion: 3, other: 2,
+    },
+    'results-first': {
+        abstract: 3, introduction: 2, 'related-work': 1, methods: 1,
+        results: 6, discussion: 5, conclusion: 3, other: 2,
+    },
+    'methods-first': {
+        abstract: 4, introduction: 3, 'related-work': 1, methods: 5,
+        results: 3, discussion: 2, conclusion: 2, other: 2,
+    },
+    'caveats-first': {
+        abstract: 3, introduction: 3, 'related-work': 1, methods: 1,
+        results: 3, discussion: 6, conclusion: 5, other: 2,
+    },
+};
+
+export function getSectionWeights(focusMode: string): Record<ReadingSectionKind, number> {
+    return FOCUS_SECTION_WEIGHTS[focusMode as FocusMode] ?? FOCUS_SECTION_WEIGHTS.balanced;
+}
+
+// ── Pattern scoring ──────────────────────────────────────────────────
 
 const POSITIVE_PATTERNS: Array<[RegExp, number]> = [
     [/\b(we (propose|present|introduce|show|find|demonstrate|observe|report))\b/i, 4],
@@ -84,24 +154,28 @@ const NEGATIVE_PATTERNS: Array<[RegExp, number]> = [
     [/\([^)]*\d{4}[^)]*\)/, -2],
 ];
 
-export function getQuickHighlightDefaults(): QuickHighlightDefaults {
+// ── Public API ───────────────────────────────────────────────────────
+
+export function getQuickHighlightDefaults(density: string = 'balanced'): QuickHighlightDefaults {
+    const config = getDensityConfig(density);
     return {
-        minChars: QUICK_MIN_CHARS,
-        maxChars: QUICK_MAX_CHARS,
-        maxWords: QUICK_MAX_WORDS,
-        maxHighlights: QUICK_MAX_HIGHLIGHTS,
+        minChars: config.quickMinChars,
+        maxChars: config.quickMaxChars,
+        maxWords: config.quickMaxWords,
+        maxHighlights: config.quickMaxHighlights,
     };
 }
 
-export function getGlobalHighlightDefaults(totalPages: number): GlobalHighlightDefaults {
+export function getGlobalHighlightDefaults(totalPages: number, density: string = 'balanced'): GlobalHighlightDefaults {
+    const config = getDensityConfig(density);
     const safePageCount = Math.max(1, totalPages);
     return {
-        minChars: GLOBAL_MIN_CHARS,
-        maxChars: GLOBAL_MAX_CHARS,
-        maxWords: GLOBAL_MAX_WORDS,
-        shortlistSize: GLOBAL_SHORTLIST_SIZE,
-        maxHighlights: Math.min(18, Math.max(6, Math.ceil(safePageCount * 1.5))),
-        maxPerPage: 2,
+        minChars: config.globalMinChars,
+        maxChars: config.globalMaxChars,
+        maxWords: config.globalMaxWords,
+        shortlistSize: config.globalShortlistSize,
+        maxHighlights: config.globalMaxHighlightsFormula(safePageCount),
+        maxPerPage: config.globalMaxPerPage,
     };
 }
 
@@ -115,14 +189,19 @@ export function inferSectionTitle(text: string, offset: number): string | null {
     return sectionTitle;
 }
 
-export function validateQuickHighlightSpans(spans: ReadingHighlightSpan[], selectionText: string): ReadingHighlightSpan[] {
-    return validateHighlightSpans(spans, selectionText, getQuickHighlightDefaults());
+export function validateQuickHighlightSpans(spans: ReadingHighlightSpan[], selectionText: string, density: string = 'balanced'): ReadingHighlightSpan[] {
+    return validateHighlightSpans(spans, selectionText, getQuickHighlightDefaults(density));
 }
 
-export function prepareGlobalHighlightSelection(pages: PaperPageText[]): PreparedGlobalHighlightSelection {
-    const defaults = getGlobalHighlightDefaults(pages.length);
-    const candidates = pages.flatMap(page => extractPageHighlightCandidates(page, defaults));
-    const shortlist = buildShortlist(candidates, defaults.shortlistSize);
+export function prepareGlobalHighlightSelection(
+    pages: PaperPageText[],
+    density: string = 'balanced',
+    focusMode: string = 'balanced'
+): PreparedGlobalHighlightSelection {
+    const defaults = getGlobalHighlightDefaults(pages.length, density);
+    const config = getDensityConfig(density);
+    const candidates = pages.flatMap(page => extractPageHighlightCandidates(page, defaults, focusMode));
+    const shortlist = buildShortlist(candidates, defaults.shortlistSize, config.shortlistPerPageCap);
 
     return {
         candidates,
@@ -134,7 +213,8 @@ export function prepareGlobalHighlightSelection(pages: PaperPageText[]): Prepare
 
 export function finalizeGlobalHighlightSelection(
     prepared: PreparedGlobalHighlightSelection,
-    selectedIds: string[]
+    selectedIds: string[],
+    minConfidence: number = 0
 ): ReadingHighlightCandidate[] {
     const lookup = new Map(prepared.shortlist.map(candidate => [candidate.id, candidate]));
     const seenIds = new Set<string>();
@@ -142,6 +222,10 @@ export function finalizeGlobalHighlightSelection(
     const perPageCount = new Map<number, number>();
     const perSectionCount = new Map<ReadingSectionKind, number>();
     const ordered: ReadingHighlightCandidate[] = [];
+    // Map minConfidence (0-1) to a minimum heuristic score threshold.
+    // Default 0.5 -> minScore 5 (filters candidates below section-weight-level quality).
+    // The formula: ceil(2 + confidence x 6) gives range [3, 8] for confidence in (0, 1].
+    const minScore = minConfidence > 0 ? Math.ceil(2 + minConfidence * 6) : 0;
 
     for (const candidateId of selectedIds) {
         if (seenIds.has(candidateId)) continue;
@@ -149,6 +233,8 @@ export function finalizeGlobalHighlightSelection(
 
         const candidate = lookup.get(candidateId);
         if (!candidate) continue;
+
+        if (minScore > 0 && candidate.heuristicScore < minScore) continue;
 
         const normalizedText = normalizeForDedup(candidate.text);
         if (!normalizedText || seenTexts.has(normalizedText)) continue;
@@ -173,6 +259,8 @@ export function finalizeGlobalHighlightSelection(
         return left.start - right.start;
     });
 }
+
+// ── Internal helpers ─────────────────────────────────────────────────
 
 function validateHighlightSpans(
     spans: ReadingHighlightSpan[],
@@ -210,7 +298,11 @@ function validateHighlightSpans(
     return validated;
 }
 
-function buildShortlist(candidates: ReadingHighlightCandidate[], shortlistSize: number): ReadingHighlightCandidate[] {
+function buildShortlist(
+    candidates: ReadingHighlightCandidate[],
+    shortlistSize: number,
+    perPageCap: number = 12
+): ReadingHighlightCandidate[] {
     const sorted = [...candidates].sort((left, right) => {
         if (right.heuristicScore !== left.heuristicScore) return right.heuristicScore - left.heuristicScore;
         if (left.pageIndex !== right.pageIndex) return left.pageIndex - right.pageIndex;
@@ -223,7 +315,7 @@ function buildShortlist(candidates: ReadingHighlightCandidate[], shortlistSize: 
 
     for (const candidate of sorted) {
         const pageCount = perPageCount.get(candidate.pageIndex) ?? 0;
-        if (pageCount >= 4) continue;
+        if (pageCount >= perPageCap) continue;
 
         const normalizedText = normalizeForDedup(candidate.text);
         if (!normalizedText || seenTexts.has(normalizedText)) continue;
@@ -240,10 +332,11 @@ function buildShortlist(candidates: ReadingHighlightCandidate[], shortlistSize: 
 
 function extractPageHighlightCandidates(
     page: PaperPageText,
-    defaults: GlobalHighlightDefaults
+    defaults: GlobalHighlightDefaults,
+    focusMode: string = 'balanced'
 ): ReadingHighlightCandidate[] {
     const headings = extractSectionHeadings(page.text);
-    const sentenceRanges = splitSentenceLikeRanges(page.text);
+    const sentenceRanges = splitSentenceLikeRanges(page.text, defaults.maxChars);
     const candidates: ReadingHighlightCandidate[] = [];
     let candidateIndex = 0;
 
@@ -255,7 +348,7 @@ function extractPageHighlightCandidates(
         if (!isReadableHighlight(text, defaults.minChars, defaults.maxChars, defaults.maxWords)) continue;
 
         const section = findSectionForOffset(headings, trimmed.start);
-        const heuristicScore = scoreCandidate(text, section.kind);
+        const heuristicScore = scoreCandidate(text, section.kind, focusMode);
         if (heuristicScore < 2) continue;
 
         candidates.push({
@@ -273,7 +366,7 @@ function extractPageHighlightCandidates(
     return candidates;
 }
 
-function splitSentenceLikeRanges(text: string): Array<{ start: number; end: number }> {
+function splitSentenceLikeRanges(text: string, maxChars: number = 240): Array<{ start: number; end: number }> {
     const ranges: Array<{ start: number; end: number }> = [];
     let start = 0;
 
@@ -297,25 +390,30 @@ function splitSentenceLikeRanges(text: string): Array<{ start: number; end: numb
         ranges.push({ start, end: text.length });
     }
 
-    return ranges.flatMap(range => splitLongRange(text, range));
+    return ranges.flatMap(range => splitLongRange(text, range, maxChars));
 }
 
-function splitLongRange(text: string, range: { start: number; end: number }): Array<{ start: number; end: number }> {
+function splitLongRange(
+    text: string,
+    range: { start: number; end: number },
+    maxChars: number = 240
+): Array<{ start: number; end: number }> {
     const raw = text.slice(range.start, range.end);
-    if (raw.length <= GLOBAL_MAX_CHARS) return [range];
+    if (raw.length <= maxChars) return [range];
 
     const breakpoints = Array.from(raw.matchAll(/(;|:|, but |, while |, whereas )/gi));
     if (!breakpoints.length) return [range];
 
     const ranges: Array<{ start: number; end: number }> = [];
     let localStart = 0;
+    const minChars = 16;
 
     for (const breakpoint of breakpoints) {
         const matchIndex = breakpoint.index ?? -1;
         if (matchIndex <= localStart) continue;
 
         const localEnd = matchIndex + breakpoint[0].length;
-        if (localEnd - localStart < GLOBAL_MIN_CHARS) continue;
+        if (localEnd - localStart < minChars) continue;
 
         ranges.push({
             start: range.start + localStart,
@@ -324,7 +422,7 @@ function splitLongRange(text: string, range: { start: number; end: number }): Ar
         localStart = localEnd;
     }
 
-    if (range.end - (range.start + localStart) >= GLOBAL_MIN_CHARS) {
+    if (range.end - (range.start + localStart) >= minChars) {
         ranges.push({ start: range.start + localStart, end: range.end });
     }
 
@@ -401,8 +499,9 @@ function findSectionForOffset(
     return activeSection;
 }
 
-function scoreCandidate(text: string, sectionKind: ReadingSectionKind): number {
-    let score = SECTION_WEIGHT[sectionKind];
+function scoreCandidate(text: string, sectionKind: ReadingSectionKind, focusMode: string = 'balanced'): number {
+    const weights = getSectionWeights(focusMode);
+    let score = weights[sectionKind];
 
     for (const [pattern, delta] of POSITIVE_PATTERNS) {
         if (pattern.test(text)) score += delta;

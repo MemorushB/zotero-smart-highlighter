@@ -1,5 +1,5 @@
 /**
- * Computes sub-rects for an entity's character range within a full text selection.
+ * Computes sub-rects for a span's character range within a full text selection.
  *
  * MVP approach: proportional interpolation based on character position ratios.
  * - Single-line (1 rect): linearly interpolate x-coords by char ratio.
@@ -175,13 +175,13 @@ function interpolateXInRect(
     widthBefore += charWidths[i];
   }
 
-  let entityWidth = 0;
+  let spanWidth = 0;
   for (let i = targetCharStart - lineCharStart; i < targetCharEnd - lineCharStart; i++) {
-    entityWidth += charWidths[i];
+    spanWidth += charWidths[i];
   }
 
   const newX1 = x1 + widthBefore;
-  const newX2 = newX1 + entityWidth;
+  const newX2 = newX1 + spanWidth;
 
   return clampRect([newX1, y1, newX2, y2]);
 }
@@ -197,46 +197,46 @@ function applyVerticalInset(rect: number[]): number[] {
 
 // ── Public API ───────────────────────────────────────────────────────
 
-export function computeEntityRects(
+export function computeSpanRects(
   fullText: string,
   fullRects: number[][],
-  entityStart: number,
-  entityEnd: number
+  spanStart: number,
+  spanEnd: number
 ): number[][] {
   // Guard: invalid inputs
   if (fullRects.length === 0) return [];
-  if (entityStart < 0 || entityEnd <= entityStart || entityStart >= fullText.length) return [];
+  if (spanStart < 0 || spanEnd <= spanStart || spanStart >= fullText.length) return [];
 
-  // Clamp entity range to text bounds
-  const clampedEnd = Math.min(entityEnd, fullText.length);
+  // Clamp span range to text bounds
+  const clampedEnd = Math.min(spanEnd, fullText.length);
 
   // Fast path: single rect
   if (fullRects.length === 1) {
-    return [applyVerticalInset(interpolateXInRect(fullRects[0], fullText, 0, fullText.length, entityStart, clampedEnd))];
+    return [applyVerticalInset(interpolateXInRect(fullRects[0], fullText, 0, fullText.length, spanStart, clampedEnd))];
   }
 
   // Multi-rect: allocate chars to lines, find overlapping rects
   const lines = allocateCharsToLines(fullText, fullRects);
-  const entityRects: number[][] = [];
+  const spanRects: number[][] = [];
 
   for (const line of lines) {
     // Skip lines with no overlap
-    if (line.charEnd <= entityStart || line.charStart >= clampedEnd) continue;
+    if (line.charEnd <= spanStart || line.charStart >= clampedEnd) continue;
 
     // Compute the overlap range within this line
-    const overlapStart = Math.max(entityStart, line.charStart);
+    const overlapStart = Math.max(spanStart, line.charStart);
     const overlapEnd = Math.min(clampedEnd, line.charEnd);
 
-    // Does the entity span the entire line?
+    // Does the span cover the entire line?
     const spansEntireLine = overlapStart === line.charStart && overlapEnd === line.charEnd;
     if (spansEntireLine) {
-      entityRects.push(applyVerticalInset(line.rect));
+      spanRects.push(applyVerticalInset(line.rect));
       continue;
     }
 
     // Partial line — interpolate x coordinates
-    entityRects.push(applyVerticalInset(interpolateXInRect(line.rect, fullText, line.charStart, line.charEnd, overlapStart, overlapEnd)));
+    spanRects.push(applyVerticalInset(interpolateXInRect(line.rect, fullText, line.charStart, line.charEnd, overlapStart, overlapEnd)));
   }
 
-  return entityRects;
+  return spanRects;
 }
