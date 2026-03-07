@@ -70,19 +70,13 @@ function getGlobalRankingSystemPrompt(focusMode: string = 'balanced'): string {
     return storedOverride;
   }
 
-  const basePrompt = [DEFAULT_GLOBAL_SYSTEM_PROMPT];
-
   const focusGuidance: Record<string, string> = {
-    'results-first': 'Give extra weight to results, evidence, and quantitative outcomes.',
-    'methods-first': 'Give extra weight to method details, design decisions, and technical contributions.',
-    'caveats-first': 'Give extra weight to limitations, caveats, failure cases, and scope boundaries.',
+    'results-first': '\nFOCUS ADJUSTMENT\nGive extra weight to results, evidence, and quantitative outcomes when applying the rubric.',
+    'methods-first': '\nFOCUS ADJUSTMENT\nGive extra weight to method details, design decisions, and technical contributions when applying the rubric.',
+    'caveats-first': '\nFOCUS ADJUSTMENT\nGive extra weight to limitations, caveats, failure cases, and scope boundaries when applying the rubric.',
   };
 
-  if (focusGuidance[focusMode]) {
-    basePrompt.push(focusGuidance[focusMode]);
-  }
-
-  return basePrompt.join(" ");
+  return DEFAULT_GLOBAL_SYSTEM_PROMPT + (focusGuidance[focusMode] || '');
 }
 
 function getLogPrefix(callerLabel?: string): string {
@@ -463,7 +457,7 @@ function buildSelectionUserPrompt(input: SelectionHighlightPromptInput, maxHighl
     `after_context: ${input.afterContext?.trim() || ""}`,
     `Task: return up to ${maxHighlights} short worth-reading spans from selection_text only.`,
     "Rules: spans must stay strictly inside selection_text, be self-contained, avoid long blocks, and may return none.",
-    "Return JSON only: {\"highlights\":[{\"text\":\"exact substring\",\"start\":0,\"end\":10,\"reason\":\"claim|result|method|caveat|problem\",\"confidence\":0.0}]}."
+    "Return JSON only: {\"highlights\":[{\"text\":\"exact substring\",\"start\":0,\"end\":10,\"reason\":\"claim|result|method|caveat|background\",\"confidence\":0.0}]}."
   ];
 
   return parts.join("\n");
@@ -473,9 +467,7 @@ function buildGlobalRankingUserPrompt(candidates: ReadingHighlightCandidate[], m
   const header = [
     `paper_title: ${paperTitle?.trim() || "unknown"}`,
     `selection_budget: up to ${maxHighlights}`,
-    "Choose the best sparse reading highlights from these candidates.",
-    "Prefer claims, results, decision-critical methods, limitations, and research gap statements.",
-    "Select fewer than the budget if precision is uncertain.",
+    "Select the best highlights from these candidates according to the rubric.",
     "Candidates:"
   ].join("\n");
 
