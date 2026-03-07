@@ -53,11 +53,11 @@
         <html:h3 data-l10n-id="pref-prompt-section">Prompt Overrides</html:h3>
 
         <html:label data-l10n-id="pref-system-prompt-label" class="pref-sublabel">Selection Highlight Prompt Override</html:label>
-        <html:textarea id="pref-systemPrompt" rows="6" class="pref-textarea" placeholder="Built-in: precision highlighting assistant with 3-gate rubric (standalone, informative, concise). Taxonomy: claim, result, method, caveat, background. Returns JSON highlights array."></html:textarea>
+        <html:textarea id="pref-systemPrompt" rows="18" class="pref-textarea"></html:textarea>
         <html:p data-l10n-id="pref-prompt-hint" class="pref-hint">Leave blank to use the built-in prompt. Any text here overrides the selection-mode system prompt.</html:p>
 
         <html:label data-l10n-id="pref-global-prompt-label" class="pref-sublabel">Full-Paper Highlight Prompt Override</html:label>
-        <html:textarea id="pref-globalSystemPrompt" rows="6" class="pref-textarea" placeholder="Built-in: 4-gate rubric (standalone readability, scholarly value, specificity, non-redundancy) with section-aware priorities, anti-position-bias rules, and precision-first policy. Returns selectedIds."></html:textarea>
+        <html:textarea id="pref-globalSystemPrompt" rows="24" class="pref-textarea"></html:textarea>
         <html:p data-l10n-id="pref-global-prompt-hint" class="pref-hint">Leave blank to use the built-in prompt. Any text here overrides the full-paper highlighting system prompt.</html:p>
 
         <html:h3 data-l10n-id="pref-quality-section">Quality Control</html:h3>

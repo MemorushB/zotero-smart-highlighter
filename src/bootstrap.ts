@@ -3,7 +3,16 @@ declare const cloneInto: ((value: any, targetScope: any, options?: any) => any) 
 
 import { extractSelectionHighlights, selectGlobalHighlightCandidateIds } from "./llm";
 import { computeSpanRects } from "./rect-splitter";
-import { PREF_DEFAULTS, PREF_PREFIX, getStoredGlobalSystemPromptOverride, getStoredSystemPromptOverride } from "./preferences";
+import {
+    DEFAULT_GLOBAL_SYSTEM_PROMPT,
+    DEFAULT_SYSTEM_PROMPT,
+    PREF_DEFAULTS,
+    PREF_PREFIX,
+    getStoredGlobalSystemPromptOverride,
+    getStoredSystemPromptOverride,
+    resolveGlobalSystemPromptPreference,
+    resolveSystemPromptPreference,
+} from "./preferences";
 import {
     finalizeGlobalHighlightSelection,
     getQuickHighlightDefaults,
@@ -2443,9 +2452,9 @@ export function startup(data: BootstrapData, reason: number) {
                 // Load current value
                 const fullKey = PREF_PREFIX + prefKey;
                 const currentValue = prefKey === 'systemPrompt'
-                    ? (getStoredSystemPromptOverride(Zotero.Prefs.get(fullKey)) ?? '')
+                    ? resolveSystemPromptPreference(Zotero.Prefs.get(fullKey))
                     : prefKey === 'globalSystemPrompt'
-                        ? (getStoredGlobalSystemPromptOverride(Zotero.Prefs.get(fullKey)) ?? '')
+                        ? resolveGlobalSystemPromptPreference(Zotero.Prefs.get(fullKey))
                         : String(Zotero.Prefs.get(fullKey) ?? '');
                 setPreferenceControlValue(input, currentValue);
                 Zotero.debug(`[Zotero PDF Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
@@ -2459,7 +2468,7 @@ export function startup(data: BootstrapData, reason: number) {
 
                             if (!storedOverride) {
                                 clearPreference(fullKey);
-                                setPreferenceControlValue(input, '');
+                                setPreferenceControlValue(input, DEFAULT_SYSTEM_PROMPT);
                             } else {
                                 Zotero.Prefs.set(fullKey, storedOverride);
                             }
@@ -2468,7 +2477,7 @@ export function startup(data: BootstrapData, reason: number) {
 
                             if (!storedOverride) {
                                 clearPreference(fullKey);
-                                setPreferenceControlValue(input, '');
+                                setPreferenceControlValue(input, DEFAULT_GLOBAL_SYSTEM_PROMPT);
                             } else {
                                 Zotero.Prefs.set(fullKey, storedOverride);
                             }
