@@ -6,3 +6,6 @@ addon/content/scripts/
 .env
 .DS_Store
 .opencode-zotero-dev.log
+zotero/
+zotero-better-notes/
+zotero-plugin-template/

@@ -17,10 +17,10 @@ This should not be treated as a greenfield rewrite. The core highlight logic is 
 
 To avoid migration drift, freeze both the structural reference and the operational baseline for this plan:
 
-- Structural reference: the root `zotero-plugin-template/` gitlink-pinned reference repo, corresponding to template package version `3.1.0`
+- Structural reference: an optional local `zotero-plugin-template/` checkout, corresponding to template package version `3.1.0`
 - Operational baseline: the migration is pinned to the root `package-lock.json` resolved scaffold version `0.8.3`; the root `package.json` dependency declaration remains `zotero-plugin-scaffold` `^0.8.3`, but that semver range is not itself the frozen baseline
 
-Do not adopt newer upstream template or scaffold changes in the middle of this migration. If the team wants to update the pinned template reference repo or move to a newer scaffold line, that should happen in a separate update pass with its own review and validation cycle.
+Do not adopt newer upstream template or scaffold changes in the middle of this migration. If the team wants to update the local template reference checkout or move to a newer scaffold line, that should happen in a separate update pass with its own review and validation cycle.
 
 ## Current Codebase Status
 
@@ -80,8 +80,8 @@ Current status by file:
 - `addon/content/scripts/**` is generated/disposable output, not a source-of-truth location, and should remain ignored.
 - `zotero-pdf-highlighter.xpi` and any other `*.xpi` files are package artifacts, not hand-maintained source files, and should remain ignored/disposable.
 - If any generated outputs are currently tracked, remove them only in the final cleanup phase rather than during the earlier runtime refactor phases.
-- `zotero/` is a gitlink-pinned upstream reference repo and should not be mixed into the plugin migration plan except where boundaries must be documented.
-- `zotero-plugin-template/` is a gitlink-pinned template reference repo that should be used as a reference, not copied wholesale into the live plugin.
+- `zotero/` may exist as an optional local upstream reference checkout and should not be mixed into the plugin migration plan except where boundaries must be documented.
+- `zotero-plugin-template/` may exist as an optional local template reference checkout that should be used as a reference, not copied wholesale into the live plugin.
 
 ## Target Template Shape
 

@@ -2,7 +2,7 @@
 
 A Zotero 8 plugin for VS Code-like semantic PDF highlighting.
 
-Reference directories at the repository root (`zotero/`, `zotero-better-notes/`, and `zotero-plugin-template/`) are pinned gitlinks to external upstream repos, not vendored snapshots maintained directly in this tree.
+Optional local reference checkouts may exist at the repository root (`zotero/`, `zotero-better-notes/`, and `zotero-plugin-template/`), but they are not tracked by this repository.
 
 ## Development (Template-style)
 

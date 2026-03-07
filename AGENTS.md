@@ -14,8 +14,8 @@
   - preference pane registration through `Zotero.PreferencePanes.register`
   - reader popup integration through `renderTextSelectionPopup`
   - reader toolbar integration through `renderToolbar`
-- `zotero/` is a gitlink-pinned upstream Zotero reference repo with its own build, lint, test, and style rules.
-- Treat root plugin work and `zotero/` work as separate environments.
+- An optional local `zotero/` checkout may exist for upstream reference work, with its own build, lint, test, and style rules.
+- Treat root plugin work and any local `zotero/` checkout as separate environments.
 
 ## Setup and environment
 
@@ -53,7 +53,7 @@
 - If a change touches only `src/` or `addon/`, the safest default verification is `npm run build`.
 - If you need finer-grained verification at the root, `npx tsc --noEmit` is supported; single-file TS checks are not documented here.
 - Do not imply that a hidden Jest, Vitest, Mocha, or ESLint workflow exists at the root without direct evidence.
-- Single-test execution is only documented for the gitlink-pinned `zotero/` reference repo, not for the plugin root.
+- Single-test execution is only documented for an optional local `zotero/` reference checkout, not for the plugin root.
 
 ## Root code style guidelines
 
@@ -92,9 +92,9 @@
 - Preferences-related packaged assets live under `addon/` and are loaded through the plugin bootstrap/registration flow.
 - If you add new files at the root, place them according to current structure rather than creating new top-level buckets casually.
 
-## Gitlink `zotero/` reference repo guidance
+## Optional local `zotero/` reference checkout guidance
 
-- `zotero/` is a separately sourced gitlink reference repo and is not governed by the root plugin's TypeScript conventions.
+- `zotero/` may be present as a separately sourced local reference checkout and is not governed by the root plugin's TypeScript conventions.
 - Read `zotero/CLAUDE.md` before making substantial edits inside `zotero/`.
 - `zotero/package.json` has its own build scripts, including `npm run build` and `npm run clean-build`.
 - `zotero/eslint.config.mjs` exists.
