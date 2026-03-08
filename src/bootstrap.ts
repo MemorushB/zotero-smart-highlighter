@@ -7,11 +7,26 @@ import {
     DEFAULT_GLOBAL_SYSTEM_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
     PREF_DEFAULTS,
-    PREF_PREFIX,
+    PREF_PREFIX_MIGRATION_VERSION,
+    type PreferenceClearOutcome,
+    type PreferenceBranchSnapshot,
+    type PreferenceKey,
+    clearCanonicalPref,
+    clearLegacyDuplicatedPrefToDefaultEquivalent,
+    getBranchSnapshot,
+    getCanonicalPref,
+    getCanonicalPrefKey,
+    getCanonicalRawPref,
+    getPrefPrefixMigrationVersion,
+    isBlankDefaultEquivalentPreferenceValue,
     getStoredGlobalSystemPromptOverride,
     getStoredSystemPromptOverride,
+    normalizePreferenceValue,
     resolveGlobalSystemPromptPreference,
     resolveSystemPromptPreference,
+    setCanonicalPref,
+    setCanonicalPrefToDefaultEquivalent,
+    setPrefPrefixMigrationVersion,
 } from "./preferences";
 import {
     finalizeGlobalHighlightSelection,
@@ -203,12 +218,14 @@ type SelectionPopupProgressStage = 'analyzing-selection' | 'preparing-geometry' 
 
 type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => void;
 
+const PREFERENCE_KEYS = Object.keys(PREF_DEFAULTS) as PreferenceKey[];
+
 // ── Preferences ──────────────────────────────────────────────────────
 
 function registerPreferenceDefaults(): void {
-    for (const [key, val] of Object.entries(PREF_DEFAULTS)) {
-        if (Zotero.Prefs.get(PREF_PREFIX + key) === undefined) {
-            Zotero.Prefs.set(PREF_PREFIX + key, val, true);
+    for (const [key, val] of Object.entries(PREF_DEFAULTS) as Array<[PreferenceKey, string]>) {
+        if (getCanonicalRawPref(key) === undefined) {
+            setCanonicalPref(key, val);
         }
     }
 }
@@ -246,15 +263,170 @@ function showTemporaryButtonState(button: any, event: any, text: string, duratio
     setButtonState(button, 'Smart Highlight', false);
 }
 
-function clearPreference(prefKey: string): void {
-    const isFullyQualifiedKey = prefKey.startsWith(PREF_PREFIX);
+function formatPreferenceValueForLog(key: PreferenceKey, value: string | undefined): string {
+    if (value === undefined) {
+        return 'missing';
+    }
 
-    if (typeof Zotero.Prefs.clear === 'function') {
-        Zotero.Prefs.clear(prefKey, isFullyQualifiedKey);
+    if (key === 'apiKey') {
+        return value ? `[redacted len=${value.length}]` : 'default-empty';
+    }
+
+    const normalizedWhitespace = value.replace(/\s+/g, ' ').trim();
+    const preview = normalizedWhitespace.length > 80
+        ? `${normalizedWhitespace.slice(0, 80)}...`
+        : normalizedWhitespace;
+
+    return JSON.stringify(preview || value);
+}
+
+function resolveMigrationWinner(snapshot: PreferenceBranchSnapshot): {
+    winnerSource: 'canonical' | 'legacy' | 'default';
+    winnerValue: string | null;
+    cleanupLegacy: boolean;
+    reason: string;
+} {
+    const { canonicalState, legacyState, canonicalNormalized, legacyNormalized } = snapshot;
+
+    if (canonicalState === 'missing' && legacyState === 'missing') {
+        return {
+            winnerSource: 'default',
+            winnerValue: null,
+            cleanupLegacy: true,
+            reason: 'both-missing',
+        };
+    }
+
+    if (canonicalState === 'non-default' && legacyState !== 'non-default') {
+        return {
+            winnerSource: 'canonical',
+            winnerValue: canonicalNormalized,
+            cleanupLegacy: true,
+            reason: 'canonical-non-default',
+        };
+    }
+
+    if (legacyState === 'non-default' && canonicalState !== 'non-default') {
+        return {
+            winnerSource: 'legacy',
+            winnerValue: legacyNormalized,
+            cleanupLegacy: true,
+            reason: 'legacy-non-default',
+        };
+    }
+
+    if (canonicalState !== 'non-default' && legacyState !== 'non-default') {
+        return {
+            winnerSource: 'canonical',
+            winnerValue: null,
+            cleanupLegacy: true,
+            reason: 'both-default-equivalent',
+        };
+    }
+
+    if (canonicalNormalized === legacyNormalized) {
+        return {
+            winnerSource: 'canonical',
+            winnerValue: canonicalNormalized,
+            cleanupLegacy: true,
+            reason: 'both-non-default-equal',
+        };
+    }
+
+    return {
+        winnerSource: 'legacy',
+        winnerValue: legacyNormalized,
+        cleanupLegacy: true,
+        reason: 'conflict-legacy-wins',
+    };
+}
+
+function verifyCanonicalPreferenceState(key: PreferenceKey, expectedValue: string | null): void {
+    const canonicalValue = getCanonicalRawPref(key);
+
+    if (expectedValue === null) {
+        const normalizedCanonicalValue = normalizePreferenceValue(key, canonicalValue);
+        if (normalizedCanonicalValue !== null) {
+            throw new Error(
+                `Expected canonical ${key} to be default-equivalent, found ${formatPreferenceValueForLog(key, canonicalValue)}`
+            );
+        }
         return;
     }
 
-    Zotero.Prefs.set(prefKey, '', isFullyQualifiedKey);
+    if (canonicalValue !== expectedValue) {
+        throw new Error(
+            `Expected canonical ${key}=${formatPreferenceValueForLog(key, expectedValue)}, found ${formatPreferenceValueForLog(key, canonicalValue)}`
+        );
+    }
+}
+
+function verifyLegacyPreferenceCleanupState(key: PreferenceKey, cleanupOutcome: PreferenceClearOutcome): void {
+    const legacySnapshot = getBranchSnapshot(key);
+
+    if (cleanupOutcome === 'cleared') {
+        if (legacySnapshot.legacyState !== 'missing') {
+            throw new Error(
+                `Expected legacy ${key} to be missing after cleanup, found ${legacySnapshot.legacyState}:${formatPreferenceValueForLog(key, legacySnapshot.legacyRaw)}`
+            );
+        }
+        return;
+    }
+
+    if (legacySnapshot.legacyState === 'non-default') {
+        throw new Error(
+            `Expected legacy ${key} to be default-equivalent after fallback cleanup, found ${formatPreferenceValueForLog(key, legacySnapshot.legacyRaw)}`
+        );
+    }
+}
+
+function migratePreferencePrefixIfNeeded(): void {
+    const existingVersion = getPrefPrefixMigrationVersion();
+    if (existingVersion === PREF_PREFIX_MIGRATION_VERSION) {
+        Zotero.debug(`[Zotero PDF Highlighter] Preference prefix migration already complete (version ${existingVersion})`);
+        return;
+    }
+
+    Zotero.debug('[Zotero PDF Highlighter] Starting preference prefix migration');
+
+    const legacyKeysToClear: PreferenceKey[] = [];
+
+    for (const key of PREFERENCE_KEYS) {
+        const snapshot = getBranchSnapshot(key);
+        const decision = resolveMigrationWinner(snapshot);
+
+        Zotero.debug(
+            `[Zotero PDF Highlighter] Pref migration ${key}: canonical=${snapshot.canonicalState}:${formatPreferenceValueForLog(key, snapshot.canonicalRaw)} `
+            + `legacy=${snapshot.legacyState}:${formatPreferenceValueForLog(key, snapshot.legacyRaw)} `
+            + `winner=${decision.winnerSource} reason=${decision.reason}`
+        );
+
+        if (decision.winnerValue === null) {
+            setCanonicalPrefToDefaultEquivalent(key);
+        } else {
+            setCanonicalPref(key, decision.winnerValue);
+        }
+
+        verifyCanonicalPreferenceState(key, decision.winnerValue);
+
+        if (decision.cleanupLegacy && snapshot.legacyRaw !== undefined) {
+            legacyKeysToClear.push(key);
+        }
+    }
+
+    for (const key of legacyKeysToClear) {
+        const cleanupOutcome = clearLegacyDuplicatedPrefToDefaultEquivalent(key);
+        verifyLegacyPreferenceCleanupState(key, cleanupOutcome);
+    }
+
+    setPrefPrefixMigrationVersion(PREF_PREFIX_MIGRATION_VERSION);
+
+    const storedVersion = getPrefPrefixMigrationVersion();
+    if (storedVersion !== PREF_PREFIX_MIGRATION_VERSION) {
+        throw new Error(`Failed to persist pref migration marker: ${storedVersion ?? 'missing'}`);
+    }
+
+    Zotero.debug('[Zotero PDF Highlighter] Preference prefix migration complete');
 }
 
 function getSelectionPopupProgressText(stage: SelectionPopupProgressStage): string {
@@ -1616,7 +1788,7 @@ async function createSelectionReadingHighlights(event: any, button: any): Promis
     const requestPromise = (async () => {
         setSelectionPopupProgress(button, 'analyzing-selection');
 
-        const density = String(Zotero.Prefs.get(PREF_PREFIX + 'density') ?? 'balanced');
+        const density = getCanonicalPref('density');
         const quickDefaults = getQuickHighlightDefaults(density);
 
         const selectionContext = await buildSelectionContext(reader, base, selectedText);
@@ -2449,6 +2621,7 @@ export function install(data: BootstrapData, reason: number) {
 
 export function startup(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero PDF Highlighter: startup");
+    migratePreferencePrefixIfNeeded();
 
     registerPreferenceDefaults();
 
@@ -2473,7 +2646,7 @@ export function startup(data: BootstrapData, reason: number) {
 
             Zotero.debug(`[Zotero PDF Highlighter] Prefs doc: ${doc?.location?.href || 'unknown'}`);
 
-            const inputs: Record<string, string> = {
+            const inputs: Record<string, PreferenceKey> = {
                 'pref-apiKey': 'apiKey',
                 'pref-baseURL': 'baseURL',
                 'pref-model': 'model',
@@ -2493,12 +2666,12 @@ export function startup(data: BootstrapData, reason: number) {
                 if (!input) continue;
 
                 // Load current value
-                const fullKey = PREF_PREFIX + prefKey;
+                const fullKey = getCanonicalPrefKey(prefKey);
                 const currentValue = prefKey === 'systemPrompt'
-                    ? resolveSystemPromptPreference(Zotero.Prefs.get(fullKey))
+                    ? resolveSystemPromptPreference(getCanonicalRawPref(prefKey))
                     : prefKey === 'globalSystemPrompt'
-                        ? resolveGlobalSystemPromptPreference(Zotero.Prefs.get(fullKey))
-                        : String(Zotero.Prefs.get(fullKey) ?? '');
+                        ? resolveGlobalSystemPromptPreference(getCanonicalRawPref(prefKey))
+                        : getCanonicalPref(prefKey);
                 setPreferenceControlValue(input, currentValue);
                 Zotero.debug(`[Zotero PDF Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
@@ -2510,22 +2683,25 @@ export function startup(data: BootstrapData, reason: number) {
                             const storedOverride = getStoredSystemPromptOverride(value);
 
                             if (!storedOverride) {
-                                clearPreference(fullKey);
+                                clearCanonicalPref(prefKey);
                                 setPreferenceControlValue(input, DEFAULT_SYSTEM_PROMPT);
                             } else {
-                                Zotero.Prefs.set(fullKey, storedOverride);
+                                setCanonicalPref(prefKey, storedOverride);
                             }
                         } else if (prefKey === 'globalSystemPrompt') {
                             const storedOverride = getStoredGlobalSystemPromptOverride(value);
 
                             if (!storedOverride) {
-                                clearPreference(fullKey);
+                                clearCanonicalPref(prefKey);
                                 setPreferenceControlValue(input, DEFAULT_GLOBAL_SYSTEM_PROMPT);
                             } else {
-                                Zotero.Prefs.set(fullKey, storedOverride);
+                                setCanonicalPref(prefKey, storedOverride);
                             }
+                        } else if (isBlankDefaultEquivalentPreferenceValue(prefKey, value)) {
+                            clearCanonicalPref(prefKey);
+                            setPreferenceControlValue(input, PREF_DEFAULTS[prefKey]);
                         } else {
-                            Zotero.Prefs.set(fullKey, value);
+                            setCanonicalPref(prefKey, value);
                         }
                         Zotero.debug(`[Zotero PDF Highlighter] Saved ${fullKey}`);
                     } catch (e) {
@@ -2598,9 +2774,9 @@ export function startup(data: BootstrapData, reason: number) {
                 const attachment = getReaderAttachment(reader);
                 const paperTitle = getPaperTitle(reader);
 
-                const density = String(Zotero.Prefs.get(PREF_PREFIX + 'density') ?? 'balanced');
-                const focusMode = String(Zotero.Prefs.get(PREF_PREFIX + 'focusMode') ?? 'balanced');
-                const minConfidence = parseFloat(String(Zotero.Prefs.get(PREF_PREFIX + 'minConfidence') ?? '0')) || 0;
+                const density = getCanonicalPref('density');
+                const focusMode = getCanonicalPref('focusMode');
+                const minConfidence = parseFloat(getCanonicalPref('minConfidence')) || 0;
 
                 const pdfViewer = internal?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfViewer;
                 const totalPages = pdfViewer?.pagesCount || 1;

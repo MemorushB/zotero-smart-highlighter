@@ -1,6 +1,6 @@
 declare const Zotero: any;
 
-import { DEFAULT_GLOBAL_SYSTEM_PROMPT, PREF_PREFIX, getNonEmptyPreferenceValue, resolveSystemPromptPreference } from "./preferences";
+import { DEFAULT_GLOBAL_SYSTEM_PROMPT, getCanonicalPref, getNonEmptyPreferenceValue, resolveSystemPromptPreference, type PreferenceKey } from "./preferences";
 import type { ReadingHighlightCandidate, ReadingHighlightSpan } from "./reading-highlights";
 
 interface ChatMessage {
@@ -92,8 +92,8 @@ function getLogPrefix(callerLabel?: string): string {
   return callerLabel ? `[Reading:${callerLabel}]` : "[Reading]";
 }
 
-function getPref(key: string): string {
-  return String(Zotero.Prefs.get(PREF_PREFIX + key) ?? "");
+function getPref(key: PreferenceKey): string {
+  return getCanonicalPref(key);
 }
 
 function classifyHttpError(status: number): LlmErrorClassification {
