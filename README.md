@@ -14,7 +14,7 @@ Chinese README: [`docs/README.zh-CN.md`](docs/README.zh-CN.md)
 
 ## Install
 
-1. Download the latest `.xpi` package from the repository's Releases page.
+1. Download the latest `.xpi` package from the repository's [Releases page](https://github.com/MemorushB/zotero-pdf-highlighter/releases).
 2. In Zotero, open `Tools` -> `Plugins`.
 3. Click the gear icon, choose `Install Add-on From File...`, and select the downloaded `.xpi`.
 4. Restart Zotero if prompted.
