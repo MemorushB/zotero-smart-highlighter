@@ -1,7 +1,14 @@
+declare const Zotero: any;
+
 export const PREF_PREFIX = 'extensions.zotero-pdf-highlighter.';
+export const LEGACY_DUPLICATED_PREF_PREFIX = 'extensions.zotero.extensions.zotero-pdf-highlighter.';
+export const PREF_PREFIX_MIGRATION_VERSION_KEY = 'prefPrefixMigrationVersion';
+export const PREF_PREFIX_MIGRATION_VERSION = '1';
 
 export type DensityLevel = 'sparse' | 'balanced' | 'dense';
 export type FocusMode = 'balanced' | 'results-first' | 'methods-first' | 'caveats-first';
+export type HighlightBackendMode = 'auto' | 'llm-preferred' | 'non-llm-only';
+export type NonLlmLexicalMethod = 'bm25' | 'tfidf';
 
 export const DEFAULT_SYSTEM_PROMPT = `You are a precision highlighting assistant for academic papers.
 
@@ -40,6 +47,7 @@ SELECTION RUBRIC - a candidate must pass ALL gates:
 2. Scholarly value: The span carries specific, non-trivial information - a claim, finding, method detail, limitation, or defined concept. Generic transitions, boilerplate, or restatements of common knowledge do not qualify.
 3. Specificity: The span names concrete objects, quantities, relationships, or conditions rather than vague generalities.
 4. Non-redundancy: The span adds information not already covered by another selected candidate. If two candidates express substantially the same idea, keep only the more self-contained one.
+5. Not citation-list content: The span must not come from References, Bibliography, Works Cited, or other citation-list sections, and must not be a standalone citation-list entry even if it contains technical terms or appears content-rich.
 
 REASON TAXONOMY (assign exactly one)
 - claim: core contribution, hypothesis, or positioning statement
@@ -75,16 +83,177 @@ PRECISION POLICY
 - If no candidate clearly satisfies the rubric, return {"selections":[]}.
 - Do not invent IDs. Only return IDs present in the candidate list.`;
 
-export const PREF_DEFAULTS: Record<string, string> = {
+export const PREF_DEFAULTS = {
     apiKey: '',
     baseURL: 'https://openrouter.ai/api/v1',
-    model: 'z-ai/glm-4.5-air:free',
+    model: 'meta-llama/llama-3.3-70b-instruct:free',
+    backendMode: 'auto',
+    nonLlmLexicalMethod: 'bm25',
     systemPrompt: '',
     globalSystemPrompt: '',
     density: 'balanced',
     focusMode: 'balanced',
     minConfidence: '0.5',
-};
+} as const;
+
+const BLANK_DEFAULT_EQUIVALENT_PREFERENCES = new Set<PreferenceKey>(['minConfidence']);
+
+export type PreferenceKey = keyof typeof PREF_DEFAULTS;
+export type PreferenceClearOutcome = 'cleared' | 'default-equivalent-written';
+
+export type PreferenceBranchState = 'missing' | 'default-equivalent' | 'non-default';
+
+export interface PreferenceBranchSnapshot {
+    key: PreferenceKey;
+    canonicalRaw: string | undefined;
+    legacyRaw: string | undefined;
+    canonicalNormalized: string | null;
+    legacyNormalized: string | null;
+    canonicalState: PreferenceBranchState;
+    legacyState: PreferenceBranchState;
+}
+
+export function getCanonicalPrefKey(key: PreferenceKey | typeof PREF_PREFIX_MIGRATION_VERSION_KEY): string {
+    return `${PREF_PREFIX}${key}`;
+}
+
+export function getLegacyDuplicatedPrefKey(key: PreferenceKey): string {
+    return `${LEGACY_DUPLICATED_PREF_PREFIX}${key}`;
+}
+
+export function getGlobalPrefByFullKey(fullKey: string): unknown {
+    return Zotero.Prefs.get(fullKey, true);
+}
+
+export function setGlobalPrefByFullKey(fullKey: string, value: string): void {
+    Zotero.Prefs.set(fullKey, value, true);
+}
+
+export function clearGlobalPrefByFullKey(fullKey: string, fallbackValue = ''): PreferenceClearOutcome {
+    if (typeof Zotero.Prefs.clear === 'function') {
+        Zotero.Prefs.clear(fullKey, true);
+        return 'cleared';
+    }
+
+    Zotero.Prefs.set(fullKey, fallbackValue, true);
+    return 'default-equivalent-written';
+}
+
+function getRawStringPrefByFullKey(fullKey: string): string | undefined {
+    const value = getGlobalPrefByFullKey(fullKey);
+    if (value === undefined) {
+        return undefined;
+    }
+
+    return typeof value === 'string' ? value : String(value);
+}
+
+export function getCanonicalRawPref(key: PreferenceKey): string | undefined {
+    return getRawStringPrefByFullKey(getCanonicalPrefKey(key));
+}
+
+export function getLegacyRawPref(key: PreferenceKey): string | undefined {
+    return getRawStringPrefByFullKey(getLegacyDuplicatedPrefKey(key));
+}
+
+export function getCanonicalPref(key: PreferenceKey): string {
+    const rawValue = getCanonicalRawPref(key);
+    const normalizedValue = normalizePreferenceValue(key, rawValue);
+    return normalizedValue ?? PREF_DEFAULTS[key];
+}
+
+export function setCanonicalPref(key: PreferenceKey, value: string): void {
+    setGlobalPrefByFullKey(getCanonicalPrefKey(key), value);
+}
+
+export function clearCanonicalPref(key: PreferenceKey): void {
+    clearGlobalPrefByFullKey(getCanonicalPrefKey(key));
+}
+
+export function clearLegacyDuplicatedPrefToDefaultEquivalent(key: PreferenceKey): PreferenceClearOutcome {
+    return clearGlobalPrefByFullKey(getLegacyDuplicatedPrefKey(key), PREF_DEFAULTS[key]);
+}
+
+export function setCanonicalPrefToDefaultEquivalent(key: PreferenceKey): void {
+    if (typeof Zotero.Prefs.clear === 'function') {
+        clearCanonicalPref(key);
+        return;
+    }
+
+    setCanonicalPref(key, PREF_DEFAULTS[key]);
+}
+
+export function getPrefPrefixMigrationVersion(): string | undefined {
+    return getRawStringPrefByFullKey(getCanonicalPrefKey(PREF_PREFIX_MIGRATION_VERSION_KEY));
+}
+
+export function setPrefPrefixMigrationVersion(version: string): void {
+    setGlobalPrefByFullKey(getCanonicalPrefKey(PREF_PREFIX_MIGRATION_VERSION_KEY), version);
+}
+
+export function isPrefDefaultEquivalent(key: PreferenceKey, value: unknown): boolean {
+    if (key === 'systemPrompt') {
+        return getStoredSystemPromptOverride(value) === null;
+    }
+
+    if (key === 'globalSystemPrompt') {
+        return getStoredGlobalSystemPromptOverride(value) === null;
+    }
+
+    if (isBlankDefaultEquivalentPreferenceValue(key, value)) {
+        return true;
+    }
+
+    return String(value ?? '') === PREF_DEFAULTS[key];
+}
+
+export function normalizePreferenceValue(key: PreferenceKey, value: unknown): string | null {
+    if (value === undefined) {
+        return null;
+    }
+
+    if (key === 'systemPrompt') {
+        return getStoredSystemPromptOverride(value);
+    }
+
+    if (key === 'globalSystemPrompt') {
+        return getStoredGlobalSystemPromptOverride(value);
+    }
+
+    const stringValue = typeof value === 'string' ? value : String(value ?? '');
+    return isPrefDefaultEquivalent(key, stringValue) ? null : stringValue;
+}
+
+export function isBlankDefaultEquivalentPreferenceValue(key: PreferenceKey, value: unknown): boolean {
+    if (!BLANK_DEFAULT_EQUIVALENT_PREFERENCES.has(key)) {
+        return false;
+    }
+
+    return getNonEmptyPreferenceValue(value) === null;
+}
+
+function getPreferenceBranchState(key: PreferenceKey, value: string | undefined): PreferenceBranchState {
+    if (value === undefined) {
+        return 'missing';
+    }
+
+    return isPrefDefaultEquivalent(key, value) ? 'default-equivalent' : 'non-default';
+}
+
+export function getBranchSnapshot(key: PreferenceKey): PreferenceBranchSnapshot {
+    const canonicalRaw = getCanonicalRawPref(key);
+    const legacyRaw = getLegacyRawPref(key);
+
+    return {
+        key,
+        canonicalRaw,
+        legacyRaw,
+        canonicalNormalized: normalizePreferenceValue(key, canonicalRaw),
+        legacyNormalized: normalizePreferenceValue(key, legacyRaw),
+        canonicalState: getPreferenceBranchState(key, canonicalRaw),
+        legacyState: getPreferenceBranchState(key, legacyRaw),
+    };
+}
 
 export function getNonEmptyPreferenceValue(value: unknown): string | null {
     const stringValue = typeof value === 'string' ? value : String(value ?? '');

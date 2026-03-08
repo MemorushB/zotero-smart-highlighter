@@ -1,6 +1,8 @@
 pref("extensions.zotero-pdf-highlighter.apiKey", "");
 pref("extensions.zotero-pdf-highlighter.baseURL", "https://openrouter.ai/api/v1");
-pref("extensions.zotero-pdf-highlighter.model", "z-ai/glm-4.5-air:free");
+pref("extensions.zotero-pdf-highlighter.model", "meta-llama/llama-3.3-70b-instruct:free");
+pref("extensions.zotero-pdf-highlighter.backendMode", "auto");
+pref("extensions.zotero-pdf-highlighter.nonLlmLexicalMethod", "bm25");
 pref("extensions.zotero-pdf-highlighter.systemPrompt", "");
 pref("extensions.zotero-pdf-highlighter.globalSystemPrompt", "");
 pref("extensions.zotero-pdf-highlighter.density", "balanced");

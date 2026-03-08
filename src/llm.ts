@@ -1,6 +1,6 @@
 declare const Zotero: any;
 
-import { DEFAULT_GLOBAL_SYSTEM_PROMPT, PREF_PREFIX, getNonEmptyPreferenceValue, resolveSystemPromptPreference } from "./preferences";
+import { DEFAULT_GLOBAL_SYSTEM_PROMPT, getCanonicalPref, getNonEmptyPreferenceValue, resolveSystemPromptPreference, type PreferenceKey } from "./preferences";
 import type { ReadingHighlightCandidate, ReadingHighlightSpan } from "./reading-highlights";
 
 interface ChatMessage {
@@ -92,8 +92,8 @@ function getLogPrefix(callerLabel?: string): string {
   return callerLabel ? `[Reading:${callerLabel}]` : "[Reading]";
 }
 
-function getPref(key: string): string {
-  return String(Zotero.Prefs.get(PREF_PREFIX + key) ?? "");
+function getPref(key: PreferenceKey): string {
+  return getCanonicalPref(key);
 }
 
 function classifyHttpError(status: number): LlmErrorClassification {
@@ -319,7 +319,7 @@ function extractMessageContent(responseJson: any): string {
 async function chatCompletion(messages: ChatMessage[], options: LlmRequestOptions = {}): Promise<string> {
   const apiKey = getPref("apiKey");
   const baseURL = getPref("baseURL") || "https://openrouter.ai/api/v1";
-  const model = getPref("model") || "z-ai/glm-4.5-air:free";
+  const model = getPref("model") || "meta-llama/llama-3.3-70b-instruct:free";
   const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const maxRetries = options.maxRetries ?? MAX_RETRIES;
   const logPrefix = getLogPrefix(options.callerLabel);
@@ -422,7 +422,7 @@ async function requestJson<T>(messages: ChatMessage[], options: LlmRequestOption
   }
 }
 
-function coerceReadingHighlightSpans(response: SelectionHighlightResponse): ReadingHighlightSpan[] {
+function coerceReadingHighlightSpans(response: SelectionHighlightResponse, sourceText: string): ReadingHighlightSpan[] {
   if (!Array.isArray(response?.highlights)) {
     return [];
   }
@@ -431,8 +431,20 @@ function coerceReadingHighlightSpans(response: SelectionHighlightResponse): Read
     if (!highlight || typeof highlight !== "object") return [];
     if (typeof highlight.start !== "number" || typeof highlight.end !== "number") return [];
 
+    const safeStart = Math.max(0, Math.min(highlight.start, sourceText.length));
+    const safeEnd = Math.max(safeStart, Math.min(highlight.end, sourceText.length));
+    let normalizedText = typeof highlight.text === "string" ? highlight.text : "";
+
+    if (!normalizedText.trim() && safeEnd > safeStart) {
+      normalizedText = sourceText.slice(safeStart, safeEnd);
+    }
+
+    if (!normalizedText.trim()) {
+      return [];
+    }
+
     return [{
-      text: typeof highlight.text === "string" ? highlight.text : "",
+      text: normalizedText,
       start: highlight.start,
       end: highlight.end,
       reason: typeof highlight.reason === "string" ? highlight.reason : undefined,
@@ -524,7 +536,7 @@ export async function extractSelectionHighlights(
     { role: "user", content: buildSelectionUserPrompt(input, maxHighlights) },
   ], options);
 
-  return coerceReadingHighlightSpans(parsed);
+  return coerceReadingHighlightSpans(parsed, input.selectionText);
 }
 
 export async function selectGlobalHighlightCandidateIds(

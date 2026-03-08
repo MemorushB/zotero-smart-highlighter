@@ -7,22 +7,43 @@ import {
     DEFAULT_GLOBAL_SYSTEM_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
     PREF_DEFAULTS,
-    PREF_PREFIX,
+    PREF_PREFIX_MIGRATION_VERSION,
+    getNonEmptyPreferenceValue,
+    type PreferenceClearOutcome,
+    type PreferenceBranchSnapshot,
+    type PreferenceKey,
+    clearCanonicalPref,
+    clearLegacyDuplicatedPrefToDefaultEquivalent,
+    getBranchSnapshot,
+    getCanonicalPref,
+    getCanonicalPrefKey,
+    getCanonicalRawPref,
+    getLegacyDuplicatedPrefKey,
+    getPrefPrefixMigrationVersion,
+    isBlankDefaultEquivalentPreferenceValue,
     getStoredGlobalSystemPromptOverride,
     getStoredSystemPromptOverride,
+    normalizePreferenceValue,
     resolveGlobalSystemPromptPreference,
     resolveSystemPromptPreference,
+    setCanonicalPref,
+    setCanonicalPrefToDefaultEquivalent,
+    setPrefPrefixMigrationVersion,
 } from "./preferences";
 import {
+    extractSelectionHighlightsNonLlm,
     finalizeGlobalHighlightSelection,
     getQuickHighlightDefaults,
     inferSectionTitle,
+    inferHighlightReason,
     prepareGlobalHighlightSelection,
+    selectGlobalHighlightCandidateIdsNonLlm,
     validateQuickHighlightSpans,
     type PaperPageText,
     type PreparedGlobalHighlightSelection,
     type ReadingHighlightCandidate,
     type ReadingHighlightSpan,
+    type RankedHighlightSelection,
 } from "./reading-highlights";
 
 export interface BootstrapData {
@@ -52,6 +73,15 @@ const MATCH_OPENING_PUNCTUATION = new Set(['(', '[', '{']);
 const MATCH_TIGHT_LEADING_PUNCTUATION = new Set([')', ']', '}', ',', '.', ';', ':', '!', '?']);
 
 type PreferenceControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+type HighlightBackend = 'llm' | 'non-llm';
+
+interface HighlightBackendPolicy {
+    mode: string;
+    apiKeyConfigured: boolean;
+    initialBackend: HighlightBackend;
+    allowFallbackToNonLlm: boolean;
+    reason: string;
+}
 
 function getHighlightColor(reason?: string): string {
     const normalizedReason = reason?.toLowerCase() || '';
@@ -63,16 +93,37 @@ function getHighlightColor(reason?: string): string {
     return '#ffd400';
 }
 
-function inferReasonFromText(text: string): string {
-    const t = text.toLowerCase();
+function getHighlightBackendPolicy(): HighlightBackendPolicy {
+    const mode = getCanonicalPref('backendMode');
+    const apiKeyConfigured = getNonEmptyPreferenceValue(getCanonicalPref('apiKey')) !== null;
 
-    if (/\b(method|approach|algorithm|procedure|framework|pipeline|architecture|implementation|technique|protocol|workflow|fine-tun|train|pretrain)\b/.test(t)) return 'method';
-    if (/\b(result|finding|found|observe|show that|demonstrate|achiev|outperform|accuracy|performance|improvement|f1.score|precision|recall|bleu|rouge)\b/.test(t)) return 'result';
-    if (/\b(caveat|limitation|however|although|despite|drawback|shortcoming|fail|degrad|inconsisten|trade.?off|risk|bias|concern)\b/.test(t)) return 'caveat';
-    if (/\b(we propose|we introduce|we present|we argue|contribution|novel|first to|key insight|hypothesis|we claim|this paper)\b/.test(t)) return 'claim';
-    if (/\b(previous|prior work|related work|background|existing|established|well.known|widely used|traditionally|literature)\b/.test(t)) return 'background';
+    if (mode === 'non-llm-only') {
+        return {
+            mode,
+            apiKeyConfigured,
+            initialBackend: 'non-llm',
+            allowFallbackToNonLlm: false,
+            reason: 'backend-mode-non-llm-only',
+        };
+    }
 
-    return 'result';
+    if (!apiKeyConfigured) {
+        return {
+            mode,
+            apiKeyConfigured,
+            initialBackend: 'non-llm',
+            allowFallbackToNonLlm: false,
+            reason: 'missing-api-key',
+        };
+    }
+
+    return {
+        mode,
+        apiKeyConfigured,
+        initialBackend: 'llm',
+        allowFallbackToNonLlm: true,
+        reason: mode === 'llm-preferred' ? 'llm-preferred' : 'auto-with-api-key',
+    };
 }
 
 function isTextareaPreferenceControl(control: Element): boolean {
@@ -205,11 +256,51 @@ type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => voi
 
 // ── Preferences ──────────────────────────────────────────────────────
 
+const PREFERENCE_KEYS = Object.keys(PREF_DEFAULTS) as PreferenceKey[];
+
 function registerPreferenceDefaults(): void {
-    for (const [key, val] of Object.entries(PREF_DEFAULTS)) {
-        if (Zotero.Prefs.get(PREF_PREFIX + key) === undefined) {
-            Zotero.Prefs.set(PREF_PREFIX + key, val, true);
+    for (const [key, val] of Object.entries(PREF_DEFAULTS) as Array<[PreferenceKey, string]>) {
+        if (getCanonicalRawPref(key) === undefined) {
+            setCanonicalPref(key, val);
         }
+    }
+}
+
+async function runHighlightBackendWithFallback<T>(
+    label: 'selection' | 'global',
+    runLlm: () => Promise<T>,
+    runNonLlm: () => T | Promise<T>
+): Promise<{ result: T; backend: HighlightBackend; usedFallback: boolean }> {
+    const policy = getHighlightBackendPolicy();
+    Zotero.debug(
+        `[Zotero PDF Highlighter] ${label} backend policy: mode=${policy.mode}, apiKeyConfigured=${policy.apiKeyConfigured ? 'yes' : 'no'}, initial=${policy.initialBackend}, reason=${policy.reason}`
+    );
+
+    if (policy.initialBackend === 'non-llm') {
+        return {
+            result: await runNonLlm(),
+            backend: 'non-llm',
+            usedFallback: false,
+        };
+    }
+
+    try {
+        return {
+            result: await runLlm(),
+            backend: 'llm',
+            usedFallback: false,
+        };
+    } catch (error: any) {
+        if (!policy.allowFallbackToNonLlm) {
+            throw error;
+        }
+
+        Zotero.debug(`[Zotero PDF Highlighter] ${label} LLM backend failed (${error?.message || error}); falling back to non-LLM`);
+        return {
+            result: await runNonLlm(),
+            backend: 'non-llm',
+            usedFallback: true,
+        };
     }
 }
 
@@ -246,15 +337,170 @@ function showTemporaryButtonState(button: any, event: any, text: string, duratio
     setButtonState(button, 'Smart Highlight', false);
 }
 
-function clearPreference(prefKey: string): void {
-    const isFullyQualifiedKey = prefKey.startsWith(PREF_PREFIX);
+function formatPreferenceValueForLog(key: PreferenceKey, value: string | undefined): string {
+    if (value === undefined) {
+        return 'missing';
+    }
 
-    if (typeof Zotero.Prefs.clear === 'function') {
-        Zotero.Prefs.clear(prefKey, isFullyQualifiedKey);
+    if (key === 'apiKey') {
+        return value ? `[redacted len=${value.length}]` : 'default-empty';
+    }
+
+    const normalizedWhitespace = value.replace(/\s+/g, ' ').trim();
+    const preview = normalizedWhitespace.length > 80
+        ? `${normalizedWhitespace.slice(0, 80)}...`
+        : normalizedWhitespace;
+
+    return JSON.stringify(preview || value);
+}
+
+function resolveMigrationWinner(snapshot: PreferenceBranchSnapshot): {
+    winnerSource: 'canonical' | 'legacy' | 'default';
+    winnerValue: string | null;
+    cleanupLegacy: boolean;
+    reason: string;
+} {
+    const { canonicalState, legacyState, canonicalNormalized, legacyNormalized } = snapshot;
+
+    if (canonicalState === 'missing' && legacyState === 'missing') {
+        return {
+            winnerSource: 'default',
+            winnerValue: null,
+            cleanupLegacy: true,
+            reason: 'both-missing',
+        };
+    }
+
+    if (canonicalState === 'non-default' && legacyState !== 'non-default') {
+        return {
+            winnerSource: 'canonical',
+            winnerValue: canonicalNormalized,
+            cleanupLegacy: true,
+            reason: 'canonical-non-default',
+        };
+    }
+
+    if (legacyState === 'non-default' && canonicalState !== 'non-default') {
+        return {
+            winnerSource: 'legacy',
+            winnerValue: legacyNormalized,
+            cleanupLegacy: true,
+            reason: 'legacy-non-default',
+        };
+    }
+
+    if (canonicalState !== 'non-default' && legacyState !== 'non-default') {
+        return {
+            winnerSource: 'canonical',
+            winnerValue: null,
+            cleanupLegacy: true,
+            reason: 'both-default-equivalent',
+        };
+    }
+
+    if (canonicalNormalized === legacyNormalized) {
+        return {
+            winnerSource: 'canonical',
+            winnerValue: canonicalNormalized,
+            cleanupLegacy: true,
+            reason: 'both-non-default-equal',
+        };
+    }
+
+    return {
+        winnerSource: 'legacy',
+        winnerValue: legacyNormalized,
+        cleanupLegacy: true,
+        reason: 'conflict-legacy-wins',
+    };
+}
+
+function verifyCanonicalPreferenceState(key: PreferenceKey, expectedValue: string | null): void {
+    const canonicalValue = getCanonicalRawPref(key);
+
+    if (expectedValue === null) {
+        const normalizedCanonicalValue = normalizePreferenceValue(key, canonicalValue);
+        if (normalizedCanonicalValue !== null) {
+            throw new Error(
+                `Expected canonical ${key} to be default-equivalent, found ${formatPreferenceValueForLog(key, canonicalValue)}`
+            );
+        }
         return;
     }
 
-    Zotero.Prefs.set(prefKey, '', isFullyQualifiedKey);
+    if (canonicalValue !== expectedValue) {
+        throw new Error(
+            `Expected canonical ${key}=${formatPreferenceValueForLog(key, expectedValue)}, found ${formatPreferenceValueForLog(key, canonicalValue)}`
+        );
+    }
+}
+
+function verifyLegacyPreferenceCleanupState(key: PreferenceKey, cleanupOutcome: PreferenceClearOutcome): void {
+    const legacySnapshot = getBranchSnapshot(key);
+
+    if (cleanupOutcome === 'cleared') {
+        if (legacySnapshot.legacyState !== 'missing') {
+            throw new Error(
+                `Expected legacy ${key} to be missing after cleanup, found ${legacySnapshot.legacyState}:${formatPreferenceValueForLog(key, legacySnapshot.legacyRaw)}`
+            );
+        }
+        return;
+    }
+
+    if (legacySnapshot.legacyState === 'non-default') {
+        throw new Error(
+            `Expected legacy ${key} to be default-equivalent after fallback cleanup, found ${formatPreferenceValueForLog(key, legacySnapshot.legacyRaw)}`
+        );
+    }
+}
+
+function migratePreferencePrefixIfNeeded(): void {
+    const existingVersion = getPrefPrefixMigrationVersion();
+    if (existingVersion === PREF_PREFIX_MIGRATION_VERSION) {
+        Zotero.debug(`[Zotero PDF Highlighter] Preference prefix migration already complete (version ${existingVersion})`);
+        return;
+    }
+
+    Zotero.debug('[Zotero PDF Highlighter] Starting preference prefix migration');
+
+    const legacyKeysToClear: PreferenceKey[] = [];
+
+    for (const key of PREFERENCE_KEYS) {
+        const snapshot = getBranchSnapshot(key);
+        const decision = resolveMigrationWinner(snapshot);
+
+        Zotero.debug(
+            `[Zotero PDF Highlighter] Pref migration ${key}: canonical=${snapshot.canonicalState}:${formatPreferenceValueForLog(key, snapshot.canonicalRaw)} `
+            + `legacy=${snapshot.legacyState}:${formatPreferenceValueForLog(key, snapshot.legacyRaw)} `
+            + `winner=${decision.winnerSource} reason=${decision.reason}`
+        );
+
+        if (decision.winnerValue === null) {
+            setCanonicalPrefToDefaultEquivalent(key);
+        } else {
+            setCanonicalPref(key, decision.winnerValue);
+        }
+
+        verifyCanonicalPreferenceState(key, decision.winnerValue);
+
+        if (decision.cleanupLegacy && snapshot.legacyRaw !== undefined) {
+            legacyKeysToClear.push(key);
+        }
+    }
+
+    for (const key of legacyKeysToClear) {
+        const cleanupOutcome = clearLegacyDuplicatedPrefToDefaultEquivalent(key);
+        verifyLegacyPreferenceCleanupState(key, cleanupOutcome);
+    }
+
+    setPrefPrefixMigrationVersion(PREF_PREFIX_MIGRATION_VERSION);
+
+    const storedVersion = getPrefPrefixMigrationVersion();
+    if (storedVersion !== PREF_PREFIX_MIGRATION_VERSION) {
+        throw new Error(`Failed to persist pref migration marker: ${storedVersion ?? 'missing'}`);
+    }
+
+    Zotero.debug('[Zotero PDF Highlighter] Preference prefix migration complete');
 }
 
 function getSelectionPopupProgressText(stage: SelectionPopupProgressStage): string {
@@ -1230,7 +1476,7 @@ async function createSelectionHighlightsFallback(
         try {
             const rects = computeSpanRects(text, baseRects, span.start, span.end);
             if (rects.length === 0) continue;
-            const reason = span.reason || inferReasonFromText(span.text);
+            const reason = span.reason || inferHighlightReason(span.text);
 
             const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
                 || Zotero.Utilities?.generateObjectKey?.()
@@ -1474,7 +1720,7 @@ async function createSelectionHighlightsWithCharPositions(
             let layer1SpanGeometryFailed = false;
             let layer2AttemptedForSpan = false;
             let layer2SpanGeometryFailed = false;
-            const reason = span.reason || inferReasonFromText(span.text);
+            const reason = span.reason || inferHighlightReason(span.text);
 
             let geometry: LayeredSpanGeometry | null = null;
 
@@ -1616,24 +1862,39 @@ async function createSelectionReadingHighlights(event: any, button: any): Promis
     const requestPromise = (async () => {
         setSelectionPopupProgress(button, 'analyzing-selection');
 
-        const density = String(Zotero.Prefs.get(PREF_PREFIX + 'density') ?? 'balanced');
+        const density = getCanonicalPref('density');
+        const lexicalMethod = getCanonicalPref('nonLlmLexicalMethod');
         const quickDefaults = getQuickHighlightDefaults(density);
 
         const selectionContext = await buildSelectionContext(reader, base, selectedText);
         let spans: ReadingHighlightSpan[];
         try {
-            const rawSpans = await extractSelectionHighlights({
-                selectionText: selectedText,
-                paperTitle: selectionContext.paperTitle,
-                sectionTitle: selectionContext.sectionTitle,
-                beforeContext: selectionContext.beforeContext,
-                afterContext: selectionContext.afterContext,
-            }, {
-                callerLabel: 'selection',
-                timeoutMs: SELECTION_HIGHLIGHT_REQUEST_TIMEOUT_MS,
-                maxRetries: SELECTION_HIGHLIGHT_REQUEST_ATTEMPTS,
-            }, quickDefaults.maxHighlights);
-            spans = validateQuickHighlightSpans(rawSpans, selectedText, density);
+            const backendResult = await runHighlightBackendWithFallback(
+                'selection',
+                async () => extractSelectionHighlights({
+                    selectionText: selectedText,
+                    paperTitle: selectionContext.paperTitle,
+                    sectionTitle: selectionContext.sectionTitle,
+                    beforeContext: selectionContext.beforeContext,
+                    afterContext: selectionContext.afterContext,
+                }, {
+                    callerLabel: 'selection',
+                    timeoutMs: SELECTION_HIGHLIGHT_REQUEST_TIMEOUT_MS,
+                    maxRetries: SELECTION_HIGHLIGHT_REQUEST_ATTEMPTS,
+                }, quickDefaults.maxHighlights),
+                () => extractSelectionHighlightsNonLlm({
+                    selectionText: selectedText,
+                    paperTitle: selectionContext.paperTitle,
+                    sectionTitle: selectionContext.sectionTitle,
+                    beforeContext: selectionContext.beforeContext,
+                    afterContext: selectionContext.afterContext,
+                }, {
+                    density,
+                    lexicalMethod,
+                })
+            );
+            spans = validateQuickHighlightSpans(backendResult.result, selectedText, density);
+            Zotero.debug(`[Zotero PDF Highlighter] Selection highlights resolved via ${backendResult.backend}${backendResult.usedFallback ? ' fallback' : ''}`);
         } catch (err: any) {
             Zotero.debug(`[Zotero PDF Highlighter] Selection highlight extraction failed: ${err?.message || err}`);
             showTemporaryButtonState(button, event, 'No highlight', 1800);
@@ -2388,13 +2649,17 @@ async function createPaperHighlightAnnotation(
     attachment: any,
     pageIndex: number,
     candidate: ReadingHighlightCandidate,
-    charPositions: CharPosition[]
+    charPositions: CharPosition[],
+    pageText?: string
 ): Promise<boolean> {
     const internal = reader?._internalReader || reader;
+    const normalizedPageText = typeof pageText === 'string' && pageText.length
+        ? pageText
+        : charPositions.map(position => position.char).join('');
     const geometry = getSpanGeometryFromCharPositions(
         { mode: 'exact', rawStart: 0, rawOffsetBase: 0 },
         charPositions,
-        charPositions.map(position => position.char).join(''),
+        normalizedPageText,
         candidate.start,
         candidate.end
     );
@@ -2450,6 +2715,7 @@ export function install(data: BootstrapData, reason: number) {
 export function startup(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero PDF Highlighter: startup");
 
+    migratePreferencePrefixIfNeeded();
     registerPreferenceDefaults();
 
     // Create global namespace for hooks (must be before PreferencePanes.register)
@@ -2473,10 +2739,12 @@ export function startup(data: BootstrapData, reason: number) {
 
             Zotero.debug(`[Zotero PDF Highlighter] Prefs doc: ${doc?.location?.href || 'unknown'}`);
 
-            const inputs: Record<string, string> = {
+            const inputs: Record<string, PreferenceKey> = {
                 'pref-apiKey': 'apiKey',
                 'pref-baseURL': 'baseURL',
                 'pref-model': 'model',
+                'pref-backendMode': 'backendMode',
+                'pref-nonLlmLexicalMethod': 'nonLlmLexicalMethod',
                 'pref-systemPrompt': 'systemPrompt',
                 'pref-globalSystemPrompt': 'globalSystemPrompt',
                 'pref-density': 'density',
@@ -2484,7 +2752,7 @@ export function startup(data: BootstrapData, reason: number) {
                 'pref-minConfidence': 'minConfidence',
             };
 
-            const handlers: Array<{ el: Element; type: string; fn: () => void }> = [];
+            const handlers: Array<{ el: Element; type: string; fn: EventListener }> = [];
 
             for (const [inputId, prefKey] of Object.entries(inputs)) {
                 const input = doc.getElementById(inputId) as PreferenceControl | null;
@@ -2493,12 +2761,12 @@ export function startup(data: BootstrapData, reason: number) {
                 if (!input) continue;
 
                 // Load current value
-                const fullKey = PREF_PREFIX + prefKey;
+                const fullKey = getCanonicalPrefKey(prefKey);
                 const currentValue = prefKey === 'systemPrompt'
-                    ? resolveSystemPromptPreference(Zotero.Prefs.get(fullKey))
+                    ? resolveSystemPromptPreference(getCanonicalRawPref(prefKey))
                     : prefKey === 'globalSystemPrompt'
-                        ? resolveGlobalSystemPromptPreference(Zotero.Prefs.get(fullKey))
-                        : String(Zotero.Prefs.get(fullKey) ?? '');
+                        ? resolveGlobalSystemPromptPreference(getCanonicalRawPref(prefKey))
+                        : getCanonicalPref(prefKey);
                 setPreferenceControlValue(input, currentValue);
                 Zotero.debug(`[Zotero PDF Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
@@ -2510,22 +2778,25 @@ export function startup(data: BootstrapData, reason: number) {
                             const storedOverride = getStoredSystemPromptOverride(value);
 
                             if (!storedOverride) {
-                                clearPreference(fullKey);
+                                clearCanonicalPref(prefKey);
                                 setPreferenceControlValue(input, DEFAULT_SYSTEM_PROMPT);
                             } else {
-                                Zotero.Prefs.set(fullKey, storedOverride);
+                                setCanonicalPref(prefKey, storedOverride);
                             }
                         } else if (prefKey === 'globalSystemPrompt') {
                             const storedOverride = getStoredGlobalSystemPromptOverride(value);
 
                             if (!storedOverride) {
-                                clearPreference(fullKey);
+                                clearCanonicalPref(prefKey);
                                 setPreferenceControlValue(input, DEFAULT_GLOBAL_SYSTEM_PROMPT);
                             } else {
-                                Zotero.Prefs.set(fullKey, storedOverride);
+                                setCanonicalPref(prefKey, storedOverride);
                             }
+                        } else if (isBlankDefaultEquivalentPreferenceValue(prefKey, value)) {
+                            clearCanonicalPref(prefKey);
+                            setPreferenceControlValue(input, PREF_DEFAULTS[prefKey]);
                         } else {
-                            Zotero.Prefs.set(fullKey, value);
+                            setCanonicalPref(prefKey, value);
                         }
                         Zotero.debug(`[Zotero PDF Highlighter] Saved ${fullKey}`);
                     } catch (e) {
@@ -2541,7 +2812,50 @@ export function startup(data: BootstrapData, reason: number) {
 
             const advToggle = doc.getElementById('advanced-toggle') as HTMLElement | null;
             const advContent = doc.getElementById('advanced-content') as HTMLElement | null;
+            const advToggleArrow = doc.getElementById('advanced-toggle-arrow') as HTMLElement | null;
             Zotero.debug(`[Zotero PDF Highlighter] advanced toggle elements: toggle=${!!advToggle}, content=${!!advContent}`);
+
+            const setAdvancedToggleExpanded = (expanded: boolean): void => {
+                if (advContent) {
+                    advContent.style.display = expanded ? '' : 'none';
+                }
+                if (advToggleArrow) {
+                    advToggleArrow.textContent = expanded ? '\u25BC' : '\u25B6';
+                }
+                if (advToggle) {
+                    advToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+                }
+            };
+
+            if (advToggle && advContent) {
+                const toggleAdvancedSettings = () => {
+                    const expanded = advContent.style.display === 'none';
+                    setAdvancedToggleExpanded(expanded);
+                };
+
+                const handleAdvancedToggleKeydown: EventListener = (event) => {
+                    if (!(event instanceof KeyboardEvent)) {
+                        return;
+                    }
+
+                    if (event.key === 'Enter') {
+                        event.preventDefault();
+                        toggleAdvancedSettings();
+                        return;
+                    }
+
+                    if (event.key === ' ') {
+                        event.preventDefault();
+                        toggleAdvancedSettings();
+                    }
+                };
+
+                setAdvancedToggleExpanded(advContent.style.display !== 'none');
+                advToggle.addEventListener('click', toggleAdvancedSettings);
+                advToggle.addEventListener('keydown', handleAdvancedToggleKeydown);
+                handlers.push({ el: advToggle, type: 'click', fn: toggleAdvancedSettings });
+                handlers.push({ el: advToggle, type: 'keydown', fn: handleAdvancedToggleKeydown });
+            }
 
             // Store cleanup function
             Zotero.ZoteroPDFHighlighter.hooks._prefsCleanup = () => {
@@ -2598,9 +2912,10 @@ export function startup(data: BootstrapData, reason: number) {
                 const attachment = getReaderAttachment(reader);
                 const paperTitle = getPaperTitle(reader);
 
-                const density = String(Zotero.Prefs.get(PREF_PREFIX + 'density') ?? 'balanced');
-                const focusMode = String(Zotero.Prefs.get(PREF_PREFIX + 'focusMode') ?? 'balanced');
-                const minConfidence = parseFloat(String(Zotero.Prefs.get(PREF_PREFIX + 'minConfidence') ?? '0')) || 0;
+                const density = getCanonicalPref('density');
+                const focusMode = getCanonicalPref('focusMode');
+                const lexicalMethod = getCanonicalPref('nonLlmLexicalMethod');
+                const minConfidence = parseFloat(getCanonicalPref('minConfidence')) || 0;
 
                 const pdfViewer = internal?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfViewer;
                 const totalPages = pdfViewer?.pagesCount || 1;
@@ -2609,6 +2924,7 @@ export function startup(data: BootstrapData, reason: number) {
 
                 const pageTexts: PaperPageText[] = [];
                 const pageCharPositions = new Map<number, CharPosition[]>();
+                const pageTextByIndex = new Map<number, string>();
 
                 for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
                     try {
@@ -2631,12 +2947,13 @@ export function startup(data: BootstrapData, reason: number) {
 
                         pageTexts.push({ pageIndex: pageIdx, text: pageText });
                         pageCharPositions.set(pageIdx, charPositions);
+                        pageTextByIndex.set(pageIdx, pageText);
                     } catch (pageErr: any) {
                         Zotero.debug(`[Zotero PDF Highlighter] Error processing page ${pageIdx}: ${pageErr?.message}`);
                     }
                 }
 
-                const preparedSelection: PreparedGlobalHighlightSelection = prepareGlobalHighlightSelection(pageTexts, density, focusMode);
+                const preparedSelection: PreparedGlobalHighlightSelection = prepareGlobalHighlightSelection(pageTexts, density, focusMode, paperTitle);
                 if (!preparedSelection.shortlist.length) {
                     button.textContent = 'No highlights';
                     setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2500);
@@ -2645,36 +2962,48 @@ export function startup(data: BootstrapData, reason: number) {
 
                 button.textContent = `Ranking ${preparedSelection.shortlist.length}...`;
 
-                let selectedHighlights: Array<{ id: string; reason?: string }> = [];
+                let selectedHighlights: RankedHighlightSelection[] = [];
                 try {
-                    selectedHighlights = await selectGlobalHighlightCandidateIds(
-                        preparedSelection.shortlist,
-                        preparedSelection.maxHighlights,
-                        paperTitle,
-                        {
-                            callerLabel: 'toolbar',
-                            timeoutMs: GLOBAL_HIGHLIGHT_REQUEST_TIMEOUT_MS,
-                            maxRetries: GLOBAL_HIGHLIGHT_REQUEST_ATTEMPTS,
-                        },
-                        focusMode
+                    const backendResult = await runHighlightBackendWithFallback(
+                        'global',
+                        async () => selectGlobalHighlightCandidateIds(
+                            preparedSelection.shortlist,
+                            preparedSelection.maxHighlights,
+                            paperTitle,
+                            {
+                                callerLabel: 'toolbar',
+                                timeoutMs: GLOBAL_HIGHLIGHT_REQUEST_TIMEOUT_MS,
+                                maxRetries: GLOBAL_HIGHLIGHT_REQUEST_ATTEMPTS,
+                            },
+                            focusMode
+                        ),
+                        () => selectGlobalHighlightCandidateIdsNonLlm(preparedSelection, { lexicalMethod })
                     );
+                    selectedHighlights = backendResult.result;
+                    Zotero.debug(`[Zotero PDF Highlighter] Global ranking resolved via ${backendResult.backend}${backendResult.usedFallback ? ' fallback' : ''}`);
+                    if (selectedHighlights.length) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Global ranking selected ${selectedHighlights.length} item(s)`);
+                    } else {
+                        Zotero.debug('[Zotero PDF Highlighter] Global ranking intentionally selected 0 item(s)');
+                    }
                 } catch (rankErr: any) {
                     Zotero.debug(`[Zotero PDF Highlighter] Global ranking failed: ${rankErr?.message || rankErr}`);
-                }
-
-                if (!selectedHighlights.length) {
-                    selectedHighlights = preparedSelection.shortlist.map(candidate => ({ id: candidate.id, reason: candidate.reason }));
-                    Zotero.debug('[Zotero PDF Highlighter] Global ranking yielded no IDs; falling back to heuristic shortlist order');
+                    button.textContent = 'Error';
+                    setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2000);
+                    return;
                 }
 
                 const selectedIds = selectedHighlights.map(selection => selection.id);
                 const reasonById = new Map(selectedHighlights.map(selection => [selection.id, selection.reason]));
 
                 const finalCandidates = finalizeGlobalHighlightSelection(preparedSelection, selectedIds, minConfidence);
+                if (!selectedHighlights.length) {
+                    Zotero.debug('[Zotero PDF Highlighter] Global ranking produced 0 final candidates by design');
+                }
                 for (const candidate of finalCandidates) {
                     candidate.reason = reasonById.get(candidate.id) ?? candidate.reason;
                     if (!candidate.reason) {
-                        candidate.reason = inferReasonFromText(candidate.text);
+                        candidate.reason = inferHighlightReason(candidate.text);
                     }
                 }
                 if (!finalCandidates.length) {
@@ -2687,10 +3016,11 @@ export function startup(data: BootstrapData, reason: number) {
                 for (const candidate of finalCandidates) {
                     const charPositions = pageCharPositions.get(candidate.pageIndex);
                     if (!charPositions?.length) continue;
+                    const pageText = pageTextByIndex.get(candidate.pageIndex);
 
                     button.textContent = `Highlight ${totalCreated + 1}/${finalCandidates.length}`;
                     try {
-                        const created = await createPaperHighlightAnnotation(reader, attachment, candidate.pageIndex, candidate, charPositions);
+                        const created = await createPaperHighlightAnnotation(reader, attachment, candidate.pageIndex, candidate, charPositions, pageText);
                         if (created) totalCreated++;
                     } catch (candidateErr: any) {
                         Zotero.debug(`[Zotero PDF Highlighter] Failed to create global highlight for "${candidate.text}": ${candidateErr?.message || candidateErr}`);
