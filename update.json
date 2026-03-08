@@ -4,7 +4,7 @@
       "updates": [
         {
           "version": "0.2.0",
-          "update_link": "https://github.com/MemorushB/zotero-smart-highlighter/releases/download/v0.2.0/zotero-pdf-highlighter.xpi",
+          "update_link": "https://github.com/MemorushB/zotero-smart-highlighter/releases/download/v0.2.0/zotero-smart-highlighter.xpi",
           "update_hash": "sha512:1a506da301992876a8eed018c382a60bdaf7a03d3102f7c5dcb582429fb673d0be60afd5403fadb619df7c4b69b87b69508bd8c0fb3fd850003e0a57dab5cc0a",
           "applications": {
             "zotero": {

@@ -4,6 +4,7 @@ export default defineConfig({
   source: ["src", "addon"],
   dist: ".scaffold/build",
   name: "Zotero Smart Highlighter",
+  xpiName: "zotero-smart-highlighter",
   id: "zotero-pdf-highlighter@memorushb.com",
   namespace: "zotero-pdf-highlighter",
   updateURL:
