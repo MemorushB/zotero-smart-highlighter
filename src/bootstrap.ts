@@ -1,10 +1,29 @@
 declare const Zotero: any;
 declare const cloneInto: ((value: any, targetScope: any, options?: any) => any) | undefined;
 
-import { extractEntities, type NerEntity } from "./llm";
-import { colorForEntityType } from "./entity-colors";
-import { computeEntityRects } from "./rect-splitter";
-import { DEFAULT_SYSTEM_PROMPT, PREF_DEFAULTS, PREF_PREFIX, getStoredSystemPromptOverride } from "./preferences";
+import { extractSelectionHighlights, selectGlobalHighlightCandidateIds } from "./llm";
+import { computeSpanRects } from "./rect-splitter";
+import {
+    DEFAULT_GLOBAL_SYSTEM_PROMPT,
+    DEFAULT_SYSTEM_PROMPT,
+    PREF_DEFAULTS,
+    PREF_PREFIX,
+    getStoredGlobalSystemPromptOverride,
+    getStoredSystemPromptOverride,
+    resolveGlobalSystemPromptPreference,
+    resolveSystemPromptPreference,
+} from "./preferences";
+import {
+    finalizeGlobalHighlightSelection,
+    getQuickHighlightDefaults,
+    inferSectionTitle,
+    prepareGlobalHighlightSelection,
+    validateQuickHighlightSpans,
+    type PaperPageText,
+    type PreparedGlobalHighlightSelection,
+    type ReadingHighlightCandidate,
+    type ReadingHighlightSpan,
+} from "./reading-highlights";
 
 export interface BootstrapData {
     id: string;
@@ -15,29 +34,73 @@ export interface BootstrapData {
 
 let registeredHandler: ((event: any) => void) | null = null;
 let toolbarHandler: ((event: any) => void) | null = null;
-const selectionNerInFlight = new Map<string, Promise<void>>();
-const FALLBACK_HIGHLIGHT_COLOR = '#ffd400';
-const HIGHLIGHT_FAILURE_MESSAGE = 'Could not create a highlight from this selection.';
+const selectionHighlightInFlight = new Map<string, Promise<void>>();
+const READING_HIGHLIGHT_COLOR = '#ffd400';
+const HIGHLIGHT_FAILURE_MESSAGE = 'Could not create reading highlights from this selection.';
 const SELECTION_RECT_OVERLAP_TOLERANCE = 2;
 const SELECTION_CHAR_WINDOW_PADDING = 24;
-const SELECTION_NER_REQUEST_TIMEOUT_MS = 45_000;
-const SELECTION_NER_REQUEST_ATTEMPTS = 1;
+const SELECTION_HIGHLIGHT_REQUEST_TIMEOUT_MS = 30_000;
+const SELECTION_HIGHLIGHT_REQUEST_ATTEMPTS = 1;
 const SELECTION_GEOMETRY_TIMEOUT_MS = 5_000;
 const POPUP_PAGE_BOOTSTRAP_TIMEOUT_MS = 750;
+const SELECTION_CONTEXT_WINDOW_CHARS = 180;
+const GLOBAL_HIGHLIGHT_REQUEST_TIMEOUT_MS = 45_000;
+const GLOBAL_HIGHLIGHT_REQUEST_ATTEMPTS = 1;
 const MATCH_SPACE_CHARACTERS = /[\s\u00A0\u1680\u180E\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/u;
 const MATCH_ZERO_WIDTH_CHARACTERS = /[\u200B\u200C\u200D\u2060\uFEFF]/u;
 const MATCH_OPENING_PUNCTUATION = new Set(['(', '[', '{']);
 const MATCH_TIGHT_LEADING_PUNCTUATION = new Set([')', ']', '}', ',', '.', ';', ':', '!', '?']);
 
-type PreferenceControl = HTMLInputElement | HTMLTextAreaElement;
+type PreferenceControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
 
-function setPreferenceControlValue(control: PreferenceControl, value: string): void {
-    control.value = value;
+function getHighlightColor(reason?: string): string {
+    const normalizedReason = reason?.toLowerCase() || '';
+    if (normalizedReason.includes('method')) return '#2ea8e5';
+    if (normalizedReason.includes('background')) return '#5fb236';
+    if (normalizedReason.includes('claim')) return '#ffd400';
+    if (normalizedReason.includes('result')) return '#ff6666';
+    if (normalizedReason.includes('caveat')) return '#f9a942';
+    return '#ffd400';
+}
 
-    if (control.localName === 'textarea') {
-        control.defaultValue = value;
-        control.textContent = value;
+function inferReasonFromText(text: string): string {
+    const t = text.toLowerCase();
+
+    if (/\b(method|approach|algorithm|procedure|framework|pipeline|architecture|implementation|technique|protocol|workflow|fine-tun|train|pretrain)\b/.test(t)) return 'method';
+    if (/\b(result|finding|found|observe|show that|demonstrate|achiev|outperform|accuracy|performance|improvement|f1.score|precision|recall|bleu|rouge)\b/.test(t)) return 'result';
+    if (/\b(caveat|limitation|however|although|despite|drawback|shortcoming|fail|degrad|inconsisten|trade.?off|risk|bias|concern)\b/.test(t)) return 'caveat';
+    if (/\b(we propose|we introduce|we present|we argue|contribution|novel|first to|key insight|hypothesis|we claim|this paper)\b/.test(t)) return 'claim';
+    if (/\b(previous|prior work|related work|background|existing|established|well.known|widely used|traditionally|literature)\b/.test(t)) return 'background';
+
+    return 'result';
+}
+
+function isTextareaPreferenceControl(control: Element): boolean {
+    const tagName = control.tagName?.toLowerCase();
+    return tagName === 'textarea' || tagName === 'html:textarea';
+}
+
+function setPreferenceControlValue(control: Element, value: string): void {
+    const valueControl = control as PreferenceControl & { defaultValue?: string };
+    valueControl.value = value;
+
+    if (!isTextareaPreferenceControl(control)) {
+        return;
     }
+
+    valueControl.defaultValue = value;
+    control.textContent = value;
+
+    const view = control.ownerDocument?.defaultView;
+    if (!view || typeof view.setTimeout !== 'function') {
+        return;
+    }
+
+    view.setTimeout(() => {
+        valueControl.value = value;
+        valueControl.defaultValue = value;
+        control.textContent = value;
+    }, 0);
 }
 
 interface AsyncTimeoutOptions {
@@ -106,7 +169,7 @@ interface AnchorRange {
     pageEnd: number;
 }
 
-interface LayeredEntityGeometry {
+interface LayeredSpanGeometry {
     layer: 1 | 2 | 3;
     rects: number[][];
     sortIndexOffset: number;
@@ -136,7 +199,7 @@ interface PopupPageIndexResolution {
     debugMessage: string | null;
 }
 
-type SelectionPopupProgressStage = 'extracting-entities' | 'preparing-geometry' | 'applying-highlights' | 'falling-back';
+type SelectionPopupProgressStage = 'analyzing-selection' | 'preparing-geometry' | 'applying-highlights';
 
 type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => void;
 
@@ -157,18 +220,30 @@ function setButtonState(button: any, text: string, disabled: boolean): void {
     button.disabled = disabled;
 }
 
+function attachToolbarButtonHoverState(button: any): void {
+    button.addEventListener('mouseenter', () => {
+        if (!button.disabled) {
+            button.style.background = 'rgba(128,128,128,0.2)';
+        }
+    });
+
+    button.addEventListener('mouseleave', () => {
+        button.style.background = 'transparent';
+    });
+}
+
 function showTemporaryButtonState(button: any, event: any, text: string, durationMs: number): void {
     setButtonState(button, text, true);
 
     const timerHost = event?.doc?.defaultView;
     if (timerHost && typeof timerHost.setTimeout === 'function') {
         timerHost.setTimeout(() => {
-            setButtonState(button, '🔬 NER Highlight', false);
+            setButtonState(button, 'Smart Highlight', false);
         }, durationMs);
         return;
     }
 
-    setButtonState(button, '🔬 NER Highlight', false);
+    setButtonState(button, 'Smart Highlight', false);
 }
 
 function clearPreference(prefKey: string): void {
@@ -184,14 +259,12 @@ function clearPreference(prefKey: string): void {
 
 function getSelectionPopupProgressText(stage: SelectionPopupProgressStage): string {
     switch (stage) {
-        case 'extracting-entities':
-            return '⏳ Extracting entities...';
+        case 'analyzing-selection':
+            return 'Analyzing...';
         case 'preparing-geometry':
-            return '⏳ Locating text...';
+            return 'Locating...';
         case 'applying-highlights':
-            return '⏳ Applying highlights...';
-        case 'falling-back':
-            return '⏳ Falling back...';
+            return 'Applying...';
     }
 }
 
@@ -211,7 +284,7 @@ function notifyHighlightFailure(event: any, button: any): 'zotero.alert' | 'inli
     }
 
     Zotero.debug('[Zotero PDF Highlighter] highlight creation failed');
-    showTemporaryButtonState(button, event, '❌ Failed', 1500);
+    showTemporaryButtonState(button, event, 'Failed', 1500);
     return 'inline-hint';
 }
 
@@ -277,6 +350,80 @@ function getReaderAttachment(reader: any): any {
         if (attachment) return attachment;
     }
     return reader?._item ?? null;
+}
+
+function getPaperTitle(reader: any): string | null {
+    const attachment = getReaderAttachment(reader);
+    const parentItem = typeof attachment?.parentItem === 'function'
+        ? attachment.parentItem()
+        : attachment?.parentItem ?? null;
+
+    const title = parentItem?.getField?.('title')
+        ?? attachment?.getField?.('title')
+        ?? parentItem?.title
+        ?? attachment?.title;
+
+    return typeof title === 'string' && title.trim() ? title.trim() : null;
+}
+
+async function buildSelectionContext(reader: any, annotationBase: any, selectedText: string): Promise<{
+    paperTitle: string | null;
+    sectionTitle: string | null;
+    beforeContext: string;
+    afterContext: string;
+}> {
+    const paperTitle = getPaperTitle(reader);
+    const popupPageIndex = resolvePopupPageIndex(reader, annotationBase);
+    if (popupPageIndex.pageIndex === null) {
+        return {
+            paperTitle,
+            sectionTitle: null,
+            beforeContext: '',
+            afterContext: '',
+        };
+    }
+
+    const internal = reader?._internalReader || reader;
+    const selectionRects = annotationBase.position?.rects ?? [];
+    const charPositions = await getCharPositionsForPage(internal, popupPageIndex.pageIndex, {
+        includeSyntheticEOL: true,
+        allowUnsafeDefaultTextExtraction: false,
+        timeoutMs: SELECTION_GEOMETRY_TIMEOUT_MS,
+    });
+    if (!charPositions.length) {
+        return {
+            paperTitle,
+            sectionTitle: null,
+            beforeContext: '',
+            afterContext: '',
+        };
+    }
+
+    const pageText = charPositions.map(position => position.char).join('');
+    const selectionWindow = findSelectionCharWindow(charPositions, selectionRects);
+    const selectionMatch = findTextMatch(
+        pageText,
+        selectedText,
+        0,
+        selectionWindow ? { start: selectionWindow.start, end: selectionWindow.end + 1 } : undefined
+    );
+    if (!selectionMatch) {
+        return {
+            paperTitle,
+            sectionTitle: null,
+            beforeContext: '',
+            afterContext: '',
+        };
+    }
+
+    const selectionStart = selectionMatch.rawStart;
+    const selectionEnd = selectionStart + selectedText.length;
+    return {
+        paperTitle,
+        sectionTitle: inferSectionTitle(pageText, selectionStart),
+        beforeContext: pageText.slice(Math.max(0, selectionStart - SELECTION_CONTEXT_WINDOW_CHARS), selectionStart).trim(),
+        afterContext: pageText.slice(selectionEnd, Math.min(pageText.length, selectionEnd + SELECTION_CONTEXT_WINDOW_CHARS)).trim(),
+    };
 }
 
 async function awaitWithOptionalTimeout<T>(promise: Promise<T>, options: AsyncTimeoutOptions = {}): Promise<T> {
@@ -363,7 +510,7 @@ function getSafeAnnotationPayload(annotation: any): any {
             ? annotation.key
             : Zotero.DataObjectUtilities?.generateKey?.() || Zotero.Utilities?.generateObjectKey?.() || `highlight_${Date.now()}`,
         type: typeof annotation?.type === 'string' && annotation.type.length ? annotation.type : 'highlight',
-        color: typeof annotation?.color === 'string' && annotation.color.length ? annotation.color : FALLBACK_HIGHLIGHT_COLOR,
+        color: typeof annotation?.color === 'string' && annotation.color.length ? annotation.color : READING_HIGHLIGHT_COLOR,
         text: typeof annotation?.text === 'string' ? annotation.text : '',
         comment: typeof annotation?.comment === 'string' ? annotation.comment : '',
         tags: getSafeAnnotationTags(annotation?.tags),
@@ -499,15 +646,15 @@ function getSortIndexForRects(pageIndex: number, charOffset: number, rects: numb
     ].join('|');
 }
 
-function getEntityFallbackSortIndex(annotationBase: any, pageIndex: number, entityOffset: number, rects: number[][]): string {
+function getSpanFallbackSortIndex(annotationBase: any, pageIndex: number, spanOffset: number, rects: number[][]): string {
     const baseSortIndex = annotationBase?.sortIndex;
     const segments = typeof baseSortIndex === 'string' ? baseSortIndex.split('|') : [];
     const baseOffset = Number.parseInt(segments[1] ?? '', 10);
     if (Number.isFinite(baseOffset)) {
-        return getSortIndexForRects(pageIndex, baseOffset + Math.max(0, entityOffset), rects);
+        return getSortIndexForRects(pageIndex, baseOffset + Math.max(0, spanOffset), rects);
     }
 
-    return getSortIndexForRects(pageIndex, Math.max(0, entityOffset), rects);
+    return getSortIndexForRects(pageIndex, Math.max(0, spanOffset), rects);
 }
 
 function getDiffShiftAtOffset(pageDiffs: number[][], offset: number): number {
@@ -721,21 +868,21 @@ function mapNormalizedSelectionOffsetToPage(match: { mode: 'exact' | 'normalized
     return Math.round(pageStart + ((pageEnd - pageStart) * ratio));
 }
 
-function tryFindAnchoredEntityNormalizedRange(
+function tryFindAnchoredSpanNormalizedRange(
     normalizedPageText: string,
     selectionMap: NormalizedTextMap,
     anchorRange: AnchorRange,
-    entityText: string,
-    entityStart: number,
-    entityEnd: number,
+    spanText: string,
+    spanStart: number,
+    spanEnd: number,
     selectionLength: number
 ): { start: number; end: number } | null {
-    const safeStart = Math.max(0, Math.min(entityStart, selectionLength));
-    const safeEnd = Math.max(safeStart, Math.min(entityEnd, selectionLength));
+    const safeStart = Math.max(0, Math.min(spanStart, selectionLength));
+    const safeEnd = Math.max(safeStart, Math.min(spanEnd, selectionLength));
     if (safeEnd <= safeStart || !normalizedPageText.length) return null;
 
-    const normalizedEntityText = buildNormalizedTextMap(entityText).text;
-    if (!normalizedEntityText.length) return null;
+    const normalizedSpanText = buildNormalizedTextMap(spanText).text;
+    if (!normalizedSpanText.length) return null;
 
     const anchorWindow = clampOffsetWindow(anchorRange.pageStart, anchorRange.pageEnd, normalizedPageText.length);
     if (!anchorWindow) return null;
@@ -756,7 +903,7 @@ function tryFindAnchoredEntityNormalizedRange(
     const selectionSpanLength = Math.max(1, anchorRange.selectionEnd - anchorRange.selectionStart);
     const pageSpanLength = Math.max(1, anchorRange.pageEnd - anchorRange.pageStart);
     const driftAllowance = Math.max(
-        normalizedEntityText.length,
+        normalizedSpanText.length,
         Math.abs(pageSpanLength - selectionSpanLength),
         8
     );
@@ -767,13 +914,13 @@ function tryFindAnchoredEntityNormalizedRange(
     );
 
     const anchoredPageText = normalizedPageText.slice(anchorWindow.start, anchorWindow.end);
-    const anchoredEntityStart = findBestSubstringStart(anchoredPageText, normalizedEntityText, localWindow ?? undefined);
-    if (anchoredEntityStart < 0) return null;
+    const anchoredSpanStart = findBestSubstringStart(anchoredPageText, normalizedSpanText, localWindow ?? undefined);
+    if (anchoredSpanStart < 0) return null;
 
-    const start = anchorWindow.start + anchoredEntityStart;
+    const start = anchorWindow.start + anchoredSpanStart;
     return {
         start,
-        end: start + normalizedEntityText.length,
+        end: start + normalizedSpanText.length,
     };
 }
 
@@ -863,16 +1010,16 @@ function mapCharWindowToRawTextWindow(
     return clampOffsetWindow(rawStart, rawEndExclusive, pageTextLength);
 }
 
-function mapEntityRangeToNormalizedPage(
+function mapSpanRangeToNormalizedPage(
     normalizedPageText: string,
     match: InternalPageMatchResult,
-    entityText: string,
-    entityStart: number,
-    entityEnd: number,
+    spanText: string,
+    spanStart: number,
+    spanEnd: number,
     selectionLength: number
 ): { start: number; end: number } | null {
-    const safeStart = Math.max(0, Math.min(entityStart, selectionLength));
-    const safeEnd = Math.max(safeStart, Math.min(entityEnd, selectionLength));
+    const safeStart = Math.max(0, Math.min(spanStart, selectionLength));
+    const safeEnd = Math.max(safeStart, Math.min(spanEnd, selectionLength));
     if (safeEnd <= safeStart) return null;
 
     if (match.mode === 'exact') {
@@ -886,16 +1033,16 @@ function mapEntityRangeToNormalizedPage(
     if (!selectionMap) return null;
 
     if (match.mode === 'anchored' && match.anchorRange) {
-        const directEntityRange = tryFindAnchoredEntityNormalizedRange(
+        const directSpanRange = tryFindAnchoredSpanNormalizedRange(
             normalizedPageText,
             selectionMap,
             match.anchorRange,
-            entityText,
+            spanText,
             safeStart,
             safeEnd,
             selectionLength
         );
-        if (directEntityRange) return directEntityRange;
+        if (directSpanRange) return directSpanRange;
     }
 
     const mappedStart = mapNormalizedSelectionOffsetToPage(match, selectionMap.rawToNorm[safeStart]);
@@ -1037,30 +1184,13 @@ async function createSingleHighlight(
     return false;
 }
 
-// ── Fallback: single yellow highlight ────────────────────────────────
+// ── Selection-only reading highlights ────────────────────────────────
 
-async function createFallbackHighlight(event: any): Promise<boolean> {
-    const base = getSafeSelectionAnnotationSnapshot(event?.params?.annotation);
-    if (!base?.position) return false;
-
-    Zotero.debug('[Zotero PDF Highlighter] using fallback single yellow highlight');
-    return createSingleHighlight(
-        event,
-        base,
-        FALLBACK_HIGHLIGHT_COLOR,
-        base.position.rects,
-        base.text || '',
-        'save'
-    );
-}
-
-// ── NER-powered multi-entity highlighting ────────────────────────────
-
-async function createNerHighlightsFallback(
+async function createSelectionHighlightsFallback(
     reader: any,
     annotationBase: any,
     text: string,
-    entities: NerEntity[]
+    spans: ReadingHighlightSpan[]
 ): Promise<number> {
     let created = 0;
     const internal = reader?._internalReader || reader;
@@ -1096,53 +1226,54 @@ async function createNerHighlightsFallback(
         Zotero.debug(`[Zotero PDF Highlighter] Fallback: No attachment found, itemID=${itemID}`);
     }
 
-    for (const entity of entities) {
+    for (const span of spans) {
         try {
-            const color = colorForEntityType(entity.type) || '#ffd400';
-            const rects = computeEntityRects(text, baseRects, entity.start, entity.end);
+            const rects = computeSpanRects(text, baseRects, span.start, span.end);
             if (rects.length === 0) continue;
+            const reason = span.reason || inferReasonFromText(span.text);
 
             const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
                 || Zotero.Utilities?.generateObjectKey?.()
-                || `ner_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                || `reading_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
             const annotationData = {
                 key: annotationKey,
                 type: 'highlight',
-                color: color,
-                text: entity.text,
-                comment: `[${entity.type}]`,
+                color: getHighlightColor(reason),
+                text: span.text,
+                comment: reason ? `[${reason}]` : '',
                 position: {
                     pageIndex: pageIndex,
                     rects: rects,
                 },
                 pageLabel: annotationBase.pageLabel || String(pageIndex + 1),
-                sortIndex: getEntityFallbackSortIndex(annotationBase, pageIndex, entity.start, rects),
+                sortIndex: getSpanFallbackSortIndex(annotationBase, pageIndex, span.start, rects),
                 tags: [],
             };
 
-            Zotero.debug(`[Zotero PDF Highlighter] Creating annotation with color: ${color}`);
+            Zotero.debug('[Zotero PDF Highlighter] Creating selection reading highlight');
 
-            // Primary: Use Zotero.Annotations.saveFromJSON (most reliable)
             if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
                 try {
-                    await saveAnnotationJsonToAttachment(attachment, annotationData);
-                    Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via saveFromJSON`);
-                    created++;
-                    refreshAnnotationView(internal);
-                    continue;  // Success, move to next entity
+                    if (await saveAnnotationJsonToAttachment(attachment, annotationData)) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via saveFromJSON`);
+                        created++;
+                        refreshAnnotationView(internal);
+                        continue;
+                    }
+
+                    Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON returned false for selection highlight "${span.text}"`);
                 } catch (saveErr: any) {
                     Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON failed: ${saveErr?.message}`);
                 }
             } else {
-                Zotero.debug(`[Zotero PDF Highlighter] Fallback: Skipping saveFromJSON: attachment=${!!attachment}, saveFromJSON=${typeof Zotero.Annotations?.saveFromJSON}`);
+                Zotero.debug(`[Zotero PDF Highlighter] Selection fallback: Skipping saveFromJSON: attachment=${!!attachment}, saveFromJSON=${typeof Zotero.Annotations?.saveFromJSON}`);
             }
 
-            // Secondary fallback: Try annotation manager
             if (mgr && typeof mgr.addAnnotation === 'function') {
                 try {
                     if (await addAnnotationViaManager(reader, mgr, annotationData)) {
-                        Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via addAnnotation`);
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via addAnnotation`);
                         created++;
                         refreshAnnotationView(internal);
                         continue;
@@ -1152,20 +1283,20 @@ async function createNerHighlightsFallback(
                 }
             }
 
-            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${entity.text}"`);
+            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${span.text}"`);
         } catch (e: any) {
-            Zotero.debug(`[Zotero PDF Highlighter] Fallback error for "${entity.text}": ${e?.message}`);
+            Zotero.debug(`[Zotero PDF Highlighter] Selection fallback error for "${span.text}": ${e?.message}`);
         }
     }
 
     return created;
 }
 
-async function createNerHighlightsWithCharPositions(
+async function createSelectionHighlightsWithCharPositions(
     reader: any,
     annotationBase: any,
     text: string,
-    entities: NerEntity[],
+    spans: ReadingHighlightSpan[],
     onProgress?: SelectionPopupProgressHandler
 ): Promise<number> {
     let created = 0;
@@ -1184,9 +1315,8 @@ async function createNerHighlightsWithCharPositions(
         Zotero.debug(`[Zotero PDF Highlighter] ${popupPageIndex.debugMessage}`);
     }
     if (popupPageIndex.pageIndex === null) {
-        onProgress?.('falling-back');
         Zotero.debug('[Zotero PDF Highlighter] Popup final layer 3 fallback reason: popup pageIndex was unavailable for safe current-page geometry');
-        return createNerHighlightsFallback(reader, annotationBase, text, entities);
+        return 0;
     }
 
     const pageIndex = popupPageIndex.pageIndex;
@@ -1328,85 +1458,84 @@ async function createNerHighlightsWithCharPositions(
     }
 
     if (!internalPageData && !layer2SelectionMatch) {
-        onProgress?.('falling-back');
         const layer3FallbackReason = geometryTimedOut
             ? 'selection geometry timed out before layer 1 or layer 2 resolved'
             : popupGeometryDiagnostics.layer2SelectionMatchFailureReason
                 || popupGeometryDiagnostics.layer1CharsUnavailableReason
                 || 'selection geometry was unavailable in both layer 1 and layer 2';
         Zotero.debug(`[Zotero PDF Highlighter] Popup final layer 3 fallback reason: ${layer3FallbackReason}`);
-        return createNerHighlightsFallback(reader, annotationBase, text, entities);
+        return createSelectionHighlightsFallback(reader, annotationBase, text, spans);
     }
 
     onProgress?.('applying-highlights');
-    for (const entity of entities) {
+    for (const span of spans) {
         try {
-            const color = colorForEntityType(entity.type) || '#ffd400';
-            let layer1AttemptedForEntity = false;
-            let layer1EntityGeometryFailed = false;
-            let layer2AttemptedForEntity = false;
-            let layer2EntityGeometryFailed = false;
+            let layer1AttemptedForSpan = false;
+            let layer1SpanGeometryFailed = false;
+            let layer2AttemptedForSpan = false;
+            let layer2SpanGeometryFailed = false;
+            const reason = span.reason || inferReasonFromText(span.text);
 
-            let geometry: LayeredEntityGeometry | null = null;
+            let geometry: LayeredSpanGeometry | null = null;
 
             if (internalPageData) {
-                layer1AttemptedForEntity = true;
-                geometry = getEntityGeometryFromReaderInternals(internalPageData, text, entity.start, entity.end, selectionRects);
+                layer1AttemptedForSpan = true;
+                geometry = getSpanGeometryFromReaderInternals(internalPageData, text, span.start, span.end, selectionRects);
                 if (!geometry) {
-                    layer1EntityGeometryFailed = true;
-                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 1 attempted but entity geometry failed for "${entity.text}"`);
+                    layer1SpanGeometryFailed = true;
+                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 1 attempted but span geometry failed for "${span.text}"`);
                 }
             }
 
             if (!geometry && internalPageData) {
-                layer2AttemptedForEntity = true;
+                layer2AttemptedForSpan = true;
                 const fallbackSelectionMatch = await ensureLayer2SelectionMatch();
-                geometry = getEntityGeometryFromCharPositions(fallbackSelectionMatch, charPositions, text, entity.start, entity.end);
+                geometry = getSpanGeometryFromCharPositions(fallbackSelectionMatch, charPositions, text, span.start, span.end);
                 if (!geometry) {
-                    layer2EntityGeometryFailed = true;
-                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 entity geometry failed for "${entity.text}"`);
+                    layer2SpanGeometryFailed = true;
+                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 span geometry failed for "${span.text}"`);
                 }
             } else if (!geometry) {
-                layer2AttemptedForEntity = true;
-                geometry = getEntityGeometryFromCharPositions(layer2SelectionMatch, charPositions, text, entity.start, entity.end);
+                layer2AttemptedForSpan = true;
+                geometry = getSpanGeometryFromCharPositions(layer2SelectionMatch, charPositions, text, span.start, span.end);
                 if (!geometry) {
-                    layer2EntityGeometryFailed = true;
-                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 entity geometry failed for "${entity.text}"`);
+                    layer2SpanGeometryFailed = true;
+                    Zotero.debug(`[Zotero PDF Highlighter] Popup layer 2 span geometry failed for "${span.text}"`);
                 }
             }
 
-            const mergedRects = geometry?.rects ?? computeEntityRects(text, annotationBase.position?.rects ?? [], entity.start, entity.end);
+            const mergedRects = geometry?.rects ?? computeSpanRects(text, annotationBase.position?.rects ?? [], span.start, span.end);
 
             if (!mergedRects.length) continue;
 
             if (geometry) {
-                Zotero.debug(`[Zotero PDF Highlighter] Using layer ${geometry.layer} geometry for "${entity.text}"`);
+                Zotero.debug(`[Zotero PDF Highlighter] Using layer ${geometry.layer} geometry for "${span.text}"`);
             } else {
                 const layer3FallbackReason = geometryTimedOut
-                    ? 'selection geometry timed out before entity geometry resolved'
-                    : layer2AttemptedForEntity && layer2EntityGeometryFailed
-                        ? layer1AttemptedForEntity && layer1EntityGeometryFailed
-                            ? 'layer 1 entity geometry failed and layer 2 entity geometry failed'
-                            : 'layer 2 entity geometry failed'
-                        : layer1AttemptedForEntity && layer1EntityGeometryFailed
-                            ? 'layer 1 entity geometry failed'
+                    ? 'selection geometry timed out before span geometry resolved'
+                    : layer2AttemptedForSpan && layer2SpanGeometryFailed
+                        ? layer1AttemptedForSpan && layer1SpanGeometryFailed
+                            ? 'layer 1 span geometry failed and layer 2 span geometry failed'
+                            : 'layer 2 span geometry failed'
+                        : layer1AttemptedForSpan && layer1SpanGeometryFailed
+                            ? 'layer 1 span geometry failed'
                             : popupGeometryDiagnostics.layer2SelectionMatchFailureReason
                                 || popupGeometryDiagnostics.layer1CharsUnavailableReason
                                 || 'precise popup geometry was unavailable';
-                Zotero.debug(`[Zotero PDF Highlighter] Popup final layer 3 fallback reason for "${entity.text}": ${layer3FallbackReason}`);
-                Zotero.debug(`[Zotero PDF Highlighter] Using layer 3 geometry for "${entity.text}"`);
+                Zotero.debug(`[Zotero PDF Highlighter] Popup final layer 3 fallback reason for "${span.text}": ${layer3FallbackReason}`);
+                Zotero.debug(`[Zotero PDF Highlighter] Using layer 3 geometry for "${span.text}"`);
             }
 
             const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
                 || Zotero.Utilities?.generateObjectKey?.()
-                || `ner_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                || `reading_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
             const annotationData = {
                 key: annotationKey,
                 type: 'highlight',
-                color: color,
-                text: entity.text,
-                comment: `[${entity.type}]`,
+                color: getHighlightColor(reason),
+                text: span.text,
+                comment: reason ? `[${reason}]` : '',
                 position: {
                     pageIndex: pageIndex,
                     rects: mergedRects,
@@ -1414,18 +1543,20 @@ async function createNerHighlightsWithCharPositions(
                 pageLabel: annotationBase.pageLabel || String(pageIndex + 1),
                 sortIndex: geometry
                     ? getSortIndexForRects(pageIndex, geometry.sortIndexOffset, mergedRects)
-                    : getEntityFallbackSortIndex(annotationBase, pageIndex, entity.start, mergedRects),
+                    : getSpanFallbackSortIndex(annotationBase, pageIndex, span.start, mergedRects),
                 tags: [],
             };
 
-            // Primary: Use Zotero.Annotations.saveFromJSON (most reliable)
             if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
                 try {
-                    await saveAnnotationJsonToAttachment(attachment, annotationData);
-                    Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via saveFromJSON`);
-                    created++;
-                    refreshAnnotationView(internal);
-                    continue;  // Success, move to next entity
+                    if (await saveAnnotationJsonToAttachment(attachment, annotationData)) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via saveFromJSON`);
+                        created++;
+                        refreshAnnotationView(internal);
+                        continue;
+                    }
+
+                    Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON returned false for selection highlight "${span.text}"`);
                 } catch (saveErr: any) {
                     Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON failed: ${saveErr?.message}`);
                 }
@@ -1433,11 +1564,10 @@ async function createNerHighlightsWithCharPositions(
                 Zotero.debug(`[Zotero PDF Highlighter] CharPositions: Skipping saveFromJSON: attachment=${!!attachment}, saveFromJSON=${typeof Zotero.Annotations?.saveFromJSON}`);
             }
 
-            // Secondary fallback: Try annotation manager
             if (mgr && typeof mgr.addAnnotation === 'function') {
                 try {
                     if (await addAnnotationViaManager(reader, mgr, annotationData)) {
-                        Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" via addAnnotation`);
+                        Zotero.debug(`[Zotero PDF Highlighter] Created selection highlight for "${span.text}" via addAnnotation`);
                         created++;
                         refreshAnnotationView(internal);
                         continue;
@@ -1447,16 +1577,16 @@ async function createNerHighlightsWithCharPositions(
                 }
             }
 
-            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${entity.text}"`);
+            Zotero.debug(`[Zotero PDF Highlighter] All methods failed for "${span.text}"`);
         } catch (e: any) {
-            Zotero.debug(`[Zotero PDF Highlighter] CharPositions failed for "${entity.text}": ${e?.message}`);
+            Zotero.debug(`[Zotero PDF Highlighter] CharPositions failed for "${span.text}": ${e?.message}`);
         }
     }
 
     return created;
 }
 
-async function createNerHighlights(event: any, button: any): Promise<void> {
+async function createSelectionReadingHighlights(event: any, button: any): Promise<void> {
     const base = getSafeSelectionAnnotationSnapshot(event?.params?.annotation);
     if (!base?.position) {
         notifyHighlightFailure(event, button);
@@ -1471,9 +1601,9 @@ async function createNerHighlights(event: any, button: any): Promise<void> {
 
     const reader = event?.reader;
     const selectionRequestKey = getSelectionRequestKey(reader, base, selectedText);
-    if (selectionNerInFlight.has(selectionRequestKey)) {
-        Zotero.debug('[Zotero PDF Highlighter] Duplicate selection NER request ignored');
-        showTemporaryButtonState(button, event, '⏳ Already running', 1200);
+    if (selectionHighlightInFlight.has(selectionRequestKey)) {
+        Zotero.debug('[Zotero PDF Highlighter] Duplicate selection reading-highlight request ignored');
+        showTemporaryButtonState(button, event, 'Already running', 1200);
         return;
     }
 
@@ -1484,59 +1614,62 @@ async function createNerHighlights(event: any, button: any): Promise<void> {
     }
 
     const requestPromise = (async () => {
-        setSelectionPopupProgress(button, 'extracting-entities');
+        setSelectionPopupProgress(button, 'analyzing-selection');
 
-        let entities: NerEntity[];
+        const density = String(Zotero.Prefs.get(PREF_PREFIX + 'density') ?? 'balanced');
+        const quickDefaults = getQuickHighlightDefaults(density);
+
+        const selectionContext = await buildSelectionContext(reader, base, selectedText);
+        let spans: ReadingHighlightSpan[];
         try {
-            entities = await extractEntities(selectedText, {
+            const rawSpans = await extractSelectionHighlights({
+                selectionText: selectedText,
+                paperTitle: selectionContext.paperTitle,
+                sectionTitle: selectionContext.sectionTitle,
+                beforeContext: selectionContext.beforeContext,
+                afterContext: selectionContext.afterContext,
+            }, {
                 callerLabel: 'selection',
-                timeoutMs: SELECTION_NER_REQUEST_TIMEOUT_MS,
-                maxRetries: SELECTION_NER_REQUEST_ATTEMPTS,
-            });
+                timeoutMs: SELECTION_HIGHLIGHT_REQUEST_TIMEOUT_MS,
+                maxRetries: SELECTION_HIGHLIGHT_REQUEST_ATTEMPTS,
+            }, quickDefaults.maxHighlights);
+            spans = validateQuickHighlightSpans(rawSpans, selectedText, density);
         } catch (err: any) {
-            Zotero.debug(`[Zotero PDF Highlighter] NER extraction failed: ${err?.message || err}`);
-            const fallbackOk = await createFallbackHighlight(event);
-            if (fallbackOk) {
-                showTemporaryButtonState(button, event, '⚠️ Fallback (1)', 2000);
-            } else {
-                notifyHighlightFailure(event, button);
-            }
+            Zotero.debug(`[Zotero PDF Highlighter] Selection highlight extraction failed: ${err?.message || err}`);
+            showTemporaryButtonState(button, event, 'No highlight', 1800);
             return;
         }
 
-        if (entities.length === 0) {
-            Zotero.debug('[Zotero PDF Highlighter] NER returned 0 entities, using fallback');
-            const fallbackOk = await createFallbackHighlight(event);
-            if (fallbackOk) {
-                showTemporaryButtonState(button, event, '⚠️ No entities', 2000);
-            } else {
-                notifyHighlightFailure(event, button);
-            }
+        if (spans.length === 0) {
+            Zotero.debug('[Zotero PDF Highlighter] Selection mode returned no valid highlights');
+            showTemporaryButtonState(button, event, 'No highlight', 1800);
             return;
         }
 
-        Zotero.debug(`[Zotero PDF Highlighter] creating highlights for ${entities.length} entities`);
+        Zotero.debug(`[Zotero PDF Highlighter] creating highlights for ${spans.length} reading spans`);
 
-        const created = await createNerHighlightsWithCharPositions(
+        const created = await createSelectionHighlightsWithCharPositions(
             reader,
             base,
             selectedText,
-            entities,
+            spans,
             stage => setSelectionPopupProgress(button, stage)
         );
-        const failCount = entities.length - created;
+        const failCount = spans.length - created;
         if (failCount === 0) {
-            showTemporaryButtonState(button, event, `✓ Done (${created})`, 2000);
+            showTemporaryButtonState(button, event, `Done (${created})`, 2000);
+        } else if (created === 0) {
+            notifyHighlightFailure(event, button);
         } else {
             showTemporaryButtonState(button, event, `⚠️ ${created}ok/${failCount}err`, 2500);
         }
     })();
 
-    selectionNerInFlight.set(selectionRequestKey, requestPromise);
+    selectionHighlightInFlight.set(selectionRequestKey, requestPromise);
     try {
         await requestPromise;
     } finally {
-        selectionNerInFlight.delete(selectionRequestKey);
+        selectionHighlightInFlight.delete(selectionRequestKey);
     }
 }
 
@@ -1858,15 +1991,15 @@ function findSelectionCharWindow(charPositions: CharPosition[], selectionRects: 
     };
 }
 
-function mapEntityRangeToPage(
+function mapSpanRangeToPage(
     match: TextMatchResult,
-    entityText: string,
-    entityStart: number,
-    entityEnd: number,
+    spanText: string,
+    spanStart: number,
+    spanEnd: number,
     selectionLength: number
 ): { start: number; end: number } | null {
-    const safeStart = Math.max(0, Math.min(entityStart, selectionLength));
-    const safeEnd = Math.max(safeStart, Math.min(entityEnd, selectionLength));
+    const safeStart = Math.max(0, Math.min(spanStart, selectionLength));
+    const safeEnd = Math.max(safeStart, Math.min(spanEnd, selectionLength));
     if (safeEnd <= safeStart) return null;
 
     if (match.mode === 'exact') {
@@ -1882,18 +2015,18 @@ function mapEntityRangeToPage(
     if (!pageMap || !selectionMap || normalizedPageStart === undefined) return null;
 
     if (match.mode === 'anchored' && match.anchorRange) {
-        const directEntityRange = tryFindAnchoredEntityNormalizedRange(
+        const directSpanRange = tryFindAnchoredSpanNormalizedRange(
             pageMap.text,
             selectionMap,
             match.anchorRange,
-            entityText,
+            spanText,
             safeStart,
             safeEnd,
             selectionLength
         );
-        if (directEntityRange) {
-            const mappedStart = match.rawOffsetBase + normalizedBoundaryToRawOffset(pageMap, directEntityRange.start);
-            let mappedEnd = match.rawOffsetBase + normalizedBoundaryToRawOffset(pageMap, directEntityRange.end);
+        if (directSpanRange) {
+            const mappedStart = match.rawOffsetBase + normalizedBoundaryToRawOffset(pageMap, directSpanRange.start);
+            let mappedEnd = match.rawOffsetBase + normalizedBoundaryToRawOffset(pageMap, directSpanRange.end);
             if (mappedEnd <= mappedStart) {
                 mappedEnd = mappedStart + 1;
             }
@@ -1923,13 +2056,13 @@ function mapEntityRangeToPage(
     return { start: mappedStart, end: mappedEnd };
 }
 
-function getEntityGeometryFromReaderInternals(
+function getSpanGeometryFromReaderInternals(
     pageData: ReaderInternalPageData,
     selectionText: string,
-    entityStart: number,
-    entityEnd: number,
+    spanStart: number,
+    spanEnd: number,
     selectionRects?: number[][]
-): LayeredEntityGeometry | null {
+): LayeredSpanGeometry | null {
     const selectionCharWindow = selectionRects?.length
         ? findSelectionReaderCharWindow(pageData.chars, selectionRects)
         : null;
@@ -1937,12 +2070,12 @@ function getEntityGeometryFromReaderInternals(
     const selectionMatch = findInternalPageMatch(pageData.pageText, selectionText, preferredWindow ?? undefined);
     if (!selectionMatch) return null;
 
-    const normalizedRange = mapEntityRangeToNormalizedPage(
+    const normalizedRange = mapSpanRangeToNormalizedPage(
         pageData.pageText,
         selectionMatch,
-        selectionText.slice(entityStart, entityEnd),
-        entityStart,
-        entityEnd,
+        selectionText.slice(spanStart, spanEnd),
+        spanStart,
+        spanEnd,
         selectionText.length
     );
     if (!normalizedRange) return null;
@@ -1964,40 +2097,40 @@ function getEntityGeometryFromReaderInternals(
     };
 }
 
-function getEntityGeometryFromCharPositions(
+function getSpanGeometryFromCharPositions(
     selectionMatch: TextMatchResult | null,
     charPositions: CharPosition[],
     selectionText: string,
-    entityStart: number,
-    entityEnd: number
-): LayeredEntityGeometry | null {
+    spanStart: number,
+    spanEnd: number
+): LayeredSpanGeometry | null {
     if (!selectionMatch || !charPositions.length) return null;
 
-    const mappedRange = mapEntityRangeToPage(
+    const mappedRange = mapSpanRangeToPage(
         selectionMatch,
-        selectionText.slice(entityStart, entityEnd),
-        entityStart,
-        entityEnd,
+        selectionText.slice(spanStart, spanEnd),
+        spanStart,
+        spanEnd,
         selectionText.length
     );
     if (!mappedRange) return null;
 
-    const entityStartInPage = Math.max(0, Math.min(mappedRange.start, charPositions.length));
-    const entityEndInPage = Math.max(entityStartInPage, Math.min(mappedRange.end, charPositions.length));
-    const entityRects: number[][] = [];
+    const spanStartInPage = Math.max(0, Math.min(mappedRange.start, charPositions.length));
+    const spanEndInPage = Math.max(spanStartInPage, Math.min(mappedRange.end, charPositions.length));
+    const spanRects: number[][] = [];
 
-    for (let i = entityStartInPage; i < entityEndInPage; i++) {
+    for (let i = spanStartInPage; i < spanEndInPage; i++) {
         const charPosition = charPositions[i];
         if (charPosition.rect[2] - charPosition.rect[0] <= 0.1) continue;
-        entityRects.push(charPosition.rect);
+        spanRects.push(charPosition.rect);
     }
 
-    if (!entityRects.length) return null;
+    if (!spanRects.length) return null;
 
     return {
         layer: 2,
-        rects: mergeAdjacentRects(entityRects),
-        sortIndexOffset: entityStartInPage,
+        rects: mergeAdjacentRects(spanRects),
+        sortIndexOffset: spanStartInPage,
     };
 }
 
@@ -2250,6 +2383,64 @@ function refreshAnnotationView(internal: any): void {
     }
 }
 
+async function createPaperHighlightAnnotation(
+    reader: any,
+    attachment: any,
+    pageIndex: number,
+    candidate: ReadingHighlightCandidate,
+    charPositions: CharPosition[]
+): Promise<boolean> {
+    const internal = reader?._internalReader || reader;
+    const geometry = getSpanGeometryFromCharPositions(
+        { mode: 'exact', rawStart: 0, rawOffsetBase: 0 },
+        charPositions,
+        charPositions.map(position => position.char).join(''),
+        candidate.start,
+        candidate.end
+    );
+    const mergedRects = geometry?.rects;
+    if (!mergedRects?.length) return false;
+
+    const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
+        || Zotero.Utilities?.generateObjectKey?.()
+        || `reading_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const annotationData = {
+        key: annotationKey,
+        type: 'highlight',
+        color: getHighlightColor(candidate.reason),
+        text: candidate.text,
+        comment: candidate.reason ? `[${candidate.reason}]` : (candidate.sectionTitle ? `[${candidate.sectionTitle}]` : ''),
+        position: {
+            pageIndex,
+            rects: mergedRects,
+        },
+        pageLabel: String(pageIndex + 1),
+        sortIndex: getSortIndexForRects(pageIndex, geometry!.sortIndexOffset, mergedRects),
+        tags: [],
+    };
+
+    if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
+        if (await saveAnnotationJsonToAttachment(attachment, annotationData)) {
+            refreshAnnotationView(internal);
+            return true;
+        }
+
+        Zotero.debug(`[Zotero PDF Highlighter] saveFromJSON returned false for global highlight "${candidate.text}"`);
+    }
+
+    const mgr = internal?._annotationManager;
+    if (mgr && typeof mgr.addAnnotation === 'function') {
+        const added = await addAnnotationViaManager(reader, mgr, annotationData);
+        if (added) {
+            refreshAnnotationView(internal);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // ── Bootstrap lifecycle ──────────────────────────────────────────────
 
 export function install(data: BootstrapData, reason: number) {
@@ -2287,6 +2478,10 @@ export function startup(data: BootstrapData, reason: number) {
                 'pref-baseURL': 'baseURL',
                 'pref-model': 'model',
                 'pref-systemPrompt': 'systemPrompt',
+                'pref-globalSystemPrompt': 'globalSystemPrompt',
+                'pref-density': 'density',
+                'pref-focusMode': 'focusMode',
+                'pref-minConfidence': 'minConfidence',
             };
 
             const handlers: Array<{ el: Element; type: string; fn: () => void }> = [];
@@ -2300,12 +2495,11 @@ export function startup(data: BootstrapData, reason: number) {
                 // Load current value
                 const fullKey = PREF_PREFIX + prefKey;
                 const currentValue = prefKey === 'systemPrompt'
-                    ? (getStoredSystemPromptOverride(Zotero.Prefs.get(fullKey)) ?? '')
-                    : String(Zotero.Prefs.get(fullKey) ?? '');
+                    ? resolveSystemPromptPreference(Zotero.Prefs.get(fullKey))
+                    : prefKey === 'globalSystemPrompt'
+                        ? resolveGlobalSystemPromptPreference(Zotero.Prefs.get(fullKey))
+                        : String(Zotero.Prefs.get(fullKey) ?? '');
                 setPreferenceControlValue(input, currentValue);
-                if (prefKey === 'systemPrompt') {
-                    input.placeholder = DEFAULT_SYSTEM_PROMPT;
-                }
                 Zotero.debug(`[Zotero PDF Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
                 // Save on change
@@ -2317,7 +2511,16 @@ export function startup(data: BootstrapData, reason: number) {
 
                             if (!storedOverride) {
                                 clearPreference(fullKey);
-                                setPreferenceControlValue(input, '');
+                                setPreferenceControlValue(input, DEFAULT_SYSTEM_PROMPT);
+                            } else {
+                                Zotero.Prefs.set(fullKey, storedOverride);
+                            }
+                        } else if (prefKey === 'globalSystemPrompt') {
+                            const storedOverride = getStoredGlobalSystemPromptOverride(value);
+
+                            if (!storedOverride) {
+                                clearPreference(fullKey);
+                                setPreferenceControlValue(input, DEFAULT_GLOBAL_SYSTEM_PROMPT);
                             } else {
                                 Zotero.Prefs.set(fullKey, storedOverride);
                             }
@@ -2336,6 +2539,10 @@ export function startup(data: BootstrapData, reason: number) {
                 handlers.push({ el: input, type: 'blur', fn: saveHandler });
             }
 
+            const advToggle = doc.getElementById('advanced-toggle') as HTMLElement | null;
+            const advContent = doc.getElementById('advanced-content') as HTMLElement | null;
+            Zotero.debug(`[Zotero PDF Highlighter] advanced toggle elements: toggle=${!!advToggle}, content=${!!advContent}`);
+
             // Store cleanup function
             Zotero.ZoteroPDFHighlighter.hooks._prefsCleanup = () => {
                 for (const { el, type, fn } of handlers) {
@@ -2352,60 +2559,63 @@ export function startup(data: BootstrapData, reason: number) {
             pluginID: 'zotero-pdf-highlighter@memorushb.com',
             src: data.rootURI + 'content/preferences.xhtml',
             scripts: [data.rootURI + 'content/preferences.js'],
-            label: 'PDF Highlighter',
+            label: 'Smart Highlight',
         });
     }
 
     registeredHandler = (event: any) => {
         const { append, doc } = event;
         const button = doc.createElement('button');
-        button.textContent = '🔬 NER Highlight';
-        button.style.backgroundColor = '#1e1e1e';
-        button.style.color = '#d4d4d4';
-        button.style.border = '1px solid #333';
-        button.style.borderRadius = '3px';
-        button.style.padding = '2px 5px';
-        button.style.cursor = 'pointer';
+        button.textContent = 'Smart Highlight';
+        button.className = 'smart-highlight-btn';
+        button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;';
+        attachToolbarButtonHoverState(button);
 
         button.onclick = async () => {
-            await createNerHighlights(event, button);
+            await createSelectionReadingHighlights(event, button);
         };
 
         append(button);
     };
     Zotero.Reader.registerEventListener('renderTextSelectionPopup', registeredHandler, 'zotero-pdf-highlighter');
 
-    // Register toolbar button for whole-document NER (all pages)
+    // Register toolbar button for whole-document reading highlights.
     toolbarHandler = (event: any) => {
         const { append, doc, reader } = event;
         const button = doc.createElement('button');
         button.id = 'zotero-pdf-highlighter-toolbar-btn';
-        button.textContent = '🔬 NER';
-        button.title = 'Run NER highlighting on ALL pages';
-        button.style.cssText = 'background:#1e1e1e;color:#d4d4d4;border:1px solid #333;border-radius:3px;padding:2px 8px;cursor:pointer;font-size:12px;margin-left:4px;';
+        button.textContent = 'Smart Highlight All';
+        button.title = 'Smart Highlight: scan entire paper';
+        button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;margin-left:4px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;';
+        attachToolbarButtonHoverState(button);
 
         button.onclick = async () => {
             button.disabled = true;
-            button.textContent = '⏳ Starting...';
+            button.textContent = 'Scanning...';
 
             try {
                 const internal = reader?._internalReader;
                 const attachment = getReaderAttachment(reader);
+                const paperTitle = getPaperTitle(reader);
 
-                // Get total page count
+                const density = String(Zotero.Prefs.get(PREF_PREFIX + 'density') ?? 'balanced');
+                const focusMode = String(Zotero.Prefs.get(PREF_PREFIX + 'focusMode') ?? 'balanced');
+                const minConfidence = parseFloat(String(Zotero.Prefs.get(PREF_PREFIX + 'minConfidence') ?? '0')) || 0;
+
                 const pdfViewer = internal?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfViewer;
                 const totalPages = pdfViewer?.pagesCount || 1;
 
                 Zotero.debug(`[Zotero PDF Highlighter] Processing ${totalPages} pages`);
 
-                let totalCreated = 0;
+                const pageTexts: PaperPageText[] = [];
+                const pageCharPositions = new Map<number, CharPosition[]>();
 
                 for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
                     try {
-                        button.textContent = `⏳ Page ${pageIdx + 1}/${totalPages}`;
+                        button.textContent = `Page ${pageIdx + 1}/${totalPages}`;
 
                         const charPositions = await getCharPositionsForPage(internal, pageIdx, {
-                            includeSyntheticEOL: false,
+                            includeSyntheticEOL: true,
                         });
                         if (!charPositions.length) {
                             Zotero.debug(`[Zotero PDF Highlighter] Page ${pageIdx} geometry unavailable, skipping`);
@@ -2419,81 +2629,82 @@ export function startup(data: BootstrapData, reason: number) {
                             continue;
                         }
 
-                        Zotero.debug(`[Zotero PDF Highlighter] Page ${pageIdx} text length: ${pageText.length}`);
-
-                        // Call NER for this page
-                        const entities = await extractEntities(pageText, { callerLabel: 'toolbar' });
-                        if (!entities || entities.length === 0) {
-                            Zotero.debug(`[Zotero PDF Highlighter] No entities found on page ${pageIdx}`);
-                            continue;
-                        }
-
-                        Zotero.debug(`[Zotero PDF Highlighter] Found ${entities.length} entities on page ${pageIdx}`);
-
-                        // Create highlights for each entity
-                        for (const entity of entities) {
-                            try {
-                                const entityColor = colorForEntityType(entity.type) || '#ffd400';
-
-                                const geometry = getEntityGeometryFromCharPositions(
-                                    { mode: 'exact', rawStart: 0, rawOffsetBase: 0 },
-                                    charPositions,
-                                    pageText,
-                                    entity.start,
-                                    entity.end
-                                );
-                                const mergedRects = geometry?.rects;
-
-                                if (!mergedRects?.length) {
-                                    Zotero.debug(`[Zotero PDF Highlighter] No rects for "${entity.text}", skipping`);
-                                    continue;
-                                }
-
-                                const annotationKey = Zotero.DataObjectUtilities?.generateKey?.()
-                                    || Zotero.Utilities?.generateObjectKey?.()
-                                    || `ner_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-                                const annotationData = {
-                                    key: annotationKey,
-                                    type: 'highlight',
-                                    color: entityColor,
-                                    text: entity.text,
-                                    comment: `[${entity.type}]`,
-                                    position: {
-                                        pageIndex: pageIdx,
-                                        rects: mergedRects,
-                                    },
-                                    pageLabel: String(pageIdx + 1),
-                                    sortIndex: getSortIndexForRects(pageIdx, geometry!.sortIndexOffset, mergedRects),
-                                    tags: [],
-                                };
-
-                                // Try to create annotation
-                                if (attachment && typeof Zotero.Annotations?.saveFromJSON === 'function') {
-                                    await saveAnnotationJsonToAttachment(attachment, annotationData);
-                                    totalCreated++;
-                                    // Refresh view after each highlight for live feedback
-                                    refreshAnnotationView(internal);
-                                    Zotero.debug(`[Zotero PDF Highlighter] Created highlight for "${entity.text}" on page ${pageIdx}`);
-                                }
-                            } catch (e: any) {
-                                Zotero.debug(`[Zotero PDF Highlighter] Failed to create highlight for "${entity.text}": ${e?.message}`);
-                            }
-                        }
-
+                        pageTexts.push({ pageIndex: pageIdx, text: pageText });
+                        pageCharPositions.set(pageIdx, charPositions);
                     } catch (pageErr: any) {
                         Zotero.debug(`[Zotero PDF Highlighter] Error processing page ${pageIdx}: ${pageErr?.message}`);
                     }
                 }
 
-                Zotero.debug(`[Zotero PDF Highlighter] Total highlights created: ${totalCreated}`);
-                button.textContent = `✓ ${totalCreated} entities`;
-                setTimeout(() => { button.textContent = '🔬 NER'; button.disabled = false; }, 3000);
+                const preparedSelection: PreparedGlobalHighlightSelection = prepareGlobalHighlightSelection(pageTexts, density, focusMode);
+                if (!preparedSelection.shortlist.length) {
+                    button.textContent = 'No highlights';
+                    setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2500);
+                    return;
+                }
+
+                button.textContent = `Ranking ${preparedSelection.shortlist.length}...`;
+
+                let selectedHighlights: Array<{ id: string; reason?: string }> = [];
+                try {
+                    selectedHighlights = await selectGlobalHighlightCandidateIds(
+                        preparedSelection.shortlist,
+                        preparedSelection.maxHighlights,
+                        paperTitle,
+                        {
+                            callerLabel: 'toolbar',
+                            timeoutMs: GLOBAL_HIGHLIGHT_REQUEST_TIMEOUT_MS,
+                            maxRetries: GLOBAL_HIGHLIGHT_REQUEST_ATTEMPTS,
+                        },
+                        focusMode
+                    );
+                } catch (rankErr: any) {
+                    Zotero.debug(`[Zotero PDF Highlighter] Global ranking failed: ${rankErr?.message || rankErr}`);
+                }
+
+                if (!selectedHighlights.length) {
+                    selectedHighlights = preparedSelection.shortlist.map(candidate => ({ id: candidate.id, reason: candidate.reason }));
+                    Zotero.debug('[Zotero PDF Highlighter] Global ranking yielded no IDs; falling back to heuristic shortlist order');
+                }
+
+                const selectedIds = selectedHighlights.map(selection => selection.id);
+                const reasonById = new Map(selectedHighlights.map(selection => [selection.id, selection.reason]));
+
+                const finalCandidates = finalizeGlobalHighlightSelection(preparedSelection, selectedIds, minConfidence);
+                for (const candidate of finalCandidates) {
+                    candidate.reason = reasonById.get(candidate.id) ?? candidate.reason;
+                    if (!candidate.reason) {
+                        candidate.reason = inferReasonFromText(candidate.text);
+                    }
+                }
+                if (!finalCandidates.length) {
+                    button.textContent = 'No highlights';
+                    setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2500);
+                    return;
+                }
+
+                let totalCreated = 0;
+                for (const candidate of finalCandidates) {
+                    const charPositions = pageCharPositions.get(candidate.pageIndex);
+                    if (!charPositions?.length) continue;
+
+                    button.textContent = `Highlight ${totalCreated + 1}/${finalCandidates.length}`;
+                    try {
+                        const created = await createPaperHighlightAnnotation(reader, attachment, candidate.pageIndex, candidate, charPositions);
+                        if (created) totalCreated++;
+                    } catch (candidateErr: any) {
+                        Zotero.debug(`[Zotero PDF Highlighter] Failed to create global highlight for "${candidate.text}": ${candidateErr?.message || candidateErr}`);
+                    }
+                }
+
+                Zotero.debug(`[Zotero PDF Highlighter] Total reading highlights created: ${totalCreated}`);
+                button.textContent = totalCreated > 0 ? `${totalCreated} highlights` : 'No highlights';
+                setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 3000);
 
             } catch (error: any) {
-                Zotero.debug(`[Zotero PDF Highlighter] Toolbar NER failed: ${error?.message || error}`);
-                button.textContent = '❌ Error';
-                setTimeout(() => { button.textContent = '🔬 NER'; button.disabled = false; }, 2000);
+                Zotero.debug(`[Zotero PDF Highlighter] Toolbar reading pass failed: ${error?.message || error}`);
+                button.textContent = 'Error';
+                setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2000);
             }
         };
 
@@ -2504,7 +2715,7 @@ export function startup(data: BootstrapData, reason: number) {
 
 export function shutdown(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero PDF Highlighter: shutdown");
-    selectionNerInFlight.clear();
+    selectionHighlightInFlight.clear();
 
     if (registeredHandler) {
         Zotero.Reader.unregisterEventListener('renderTextSelectionPopup', registeredHandler);

@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "Zotero PDF Highlighter",
   "version": "0.2.0",
-  "description": "LLM-powered NER semantic highlighting for academic PDFs",
+  "description": "LLM-powered reading assistant with worth-reading highlights for academic PDFs",
   "author": "MemorushB",
   "icons": {
     "48": "content/icons/icon48.png",
