@@ -1,4 +1,4 @@
-# Zotero PDF Highlighter
+# Zotero Smart Highlighter
 
 Smart PDF highlighting for Zotero 8, designed to surface the most useful claims, results, methods, and caveats while you read.
 
