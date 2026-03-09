@@ -1,8 +1,12 @@
-# Zotero Smart Highlighter
+<div align="center">
+  <img src="./logo.png" alt="Zotero Smart Highlighter logo" width="112" />
 
-面向 Zotero 8 的智能 PDF 高亮插件，帮助你在阅读时快速标出最值得回看的观点、结果、方法与局限。
+  # 🖍️ Zotero Smart Highlighter
 
-English README: [`../README.md`](../README.md)
+  面向 Zotero 8 的智能 PDF 高亮插件，帮助你在阅读时快速标出最值得回看的观点、结果、方法与局限。
+
+  [Read in English](../README.md)
+</div>
 
 ## 功能概览
 
@@ -34,21 +38,6 @@ English README: [`../README.md`](../README.md)
 - `Prompt Overrides`：高级选项，可分别覆盖选区模式和全文模式使用的提示词。
 - `Min Confidence`、`Highlight Density`、`Reading Focus`：分别控制筛选阈值、高亮数量和优先关注的论文内容。
 
-## 开发
-
-```bash
-npm install
-cp .env.example .env
-npm start
-```
-
-启动开发环境前，请先在 `.env` 中设置 `ZOTERO_PLUGIN_ZOTERO_BIN_PATH`。`npm start` 会监听 `src/` 和 `addon/` 的变化，自动重建并重新加载插件。
-
-构建插件并执行根目录类型检查：
-
-```bash
-npm run build
-```
 
 ## 项目状态
 

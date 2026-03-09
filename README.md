@@ -1,8 +1,14 @@
-# Zotero Smart Highlighter
+<div align="center">
+  <img src="./docs/logo.png" alt="Zotero Smart Highlighter logo" width="112" />
 
-Smart PDF highlighting for Zotero 8, designed to surface the most useful claims, results, methods, and caveats while you read.
+  # 🖍️ Zotero Smart Highlighter
 
-Chinese README: [`docs/README.zh-CN.md`](docs/README.zh-CN.md)
+  [![Using Zotero Plugin Template](https://img.shields.io/badge/Using-Zotero%20Plugin%20Template-blue?style=flat-square&logo=github)](https://github.com/windingwind/zotero-plugin-template)
+
+  Smart PDF highlighting for Zotero 8, designed to surface the most useful claims, results, methods, and caveats while you read.
+
+  [Read in Chinese](docs/README.zh-CN.md)
+</div>
 
 ## Feature overview
 
@@ -34,21 +40,9 @@ Chinese README: [`docs/README.zh-CN.md`](docs/README.zh-CN.md)
 - `Prompt Overrides`: optional advanced settings for custom selection-mode and full-paper prompts.
 - `Min Confidence`, `Highlight Density`, and `Reading Focus`: control how aggressive the highlighting should be and which parts of a paper are prioritized.
 
-## Development
+## 🔔 Disclaimer
 
-```bash
-npm install
-cp .env.example .env
-npm start
-```
-
-Set `ZOTERO_PLUGIN_ZOTERO_BIN_PATH` in `.env` before starting the dev server. `npm start` watches `src/` and `addon/`, rebuilds automatically, and reloads the plugin during development.
-
-Build the plugin and run the root type check with:
-
-```bash
-npm run build
-```
+Use this code under AGPL. No warranties are provided. Keep the laws of your locality in mind!
 
 ## Project status
 
