@@ -46,6 +46,8 @@ import {
     type RankedHighlightSelection,
 } from "./reading-highlights";
 
+let pluginRootURI = '';
+
 export interface BootstrapData {
     id: string;
     version: string;
@@ -306,8 +308,21 @@ async function runHighlightBackendWithFallback<T>(
 
 // ── UI feedback helpers ──────────────────────────────────────────────
 
+function setButtonText(button: any, text: string): void {
+    const span = button.querySelector('.smart-highlight-label');
+    if (span) {
+        span.textContent = text;
+        if (span.dataset.toggleable === 'true') {
+            const isIdle = text === 'Smart Highlight' || text === '';
+            span.style.display = isIdle ? 'none' : 'inline';
+        }
+    } else {
+        button.title = text;
+    }
+}
+
 function setButtonState(button: any, text: string, disabled: boolean): void {
-    button.textContent = text;
+    setButtonText(button, text);
     button.disabled = disabled;
 }
 
@@ -2714,6 +2729,7 @@ export function install(data: BootstrapData, reason: number) {
 
 export function startup(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero Smart Highlighter: startup");
+    pluginRootURI = data.rootURI || '';
 
     migratePreferencePrefixIfNeeded();
     registerPreferenceDefaults();
@@ -2874,15 +2890,28 @@ export function startup(data: BootstrapData, reason: number) {
             src: data.rootURI + 'content/preferences.xhtml',
             scripts: [data.rootURI + 'content/preferences.js'],
             label: 'Smart Highlight',
+            image: data.rootURI + 'content/icons/icon32.png',
         });
     }
 
     registeredHandler = (event: any) => {
         const { append, doc } = event;
         const button = doc.createElement('button');
-        button.textContent = 'Smart Highlight';
         button.className = 'smart-highlight-btn';
-        button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;';
+        button.title = 'Smart Highlight';
+        button.style.cssText = 'padding:4px 6px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;display:inline-flex;align-items:center;gap:4px;';
+        const img = doc.createElement('img');
+        img.src = pluginRootURI + 'content/icons/icon16.png';
+        img.alt = '✦';
+        img.style.cssText = 'width:16px;height:16px;';
+        img.className = 'smart-highlight-icon';
+        img.onerror = () => { img.style.display = 'none'; button.textContent = '✦'; };
+        const popupLabel = doc.createElement('span');
+        popupLabel.className = 'smart-highlight-label';
+        popupLabel.style.cssText = 'display:none;font-size:11px;';
+        popupLabel.dataset.toggleable = 'true';
+        button.appendChild(img);
+        button.appendChild(popupLabel);
         attachToolbarButtonHoverState(button);
 
         button.onclick = async () => {
@@ -2898,14 +2927,24 @@ export function startup(data: BootstrapData, reason: number) {
         const { append, doc, reader } = event;
         const button = doc.createElement('button');
         button.id = 'zotero-pdf-highlighter-toolbar-btn';
-        button.textContent = 'Smart Highlight All';
         button.title = 'Smart Highlight: scan entire paper';
-        button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;margin-left:4px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;';
+        button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;margin-left:4px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;display:inline-flex;align-items:center;gap:4px;';
+        const toolbarIcon = doc.createElement('img');
+        toolbarIcon.src = pluginRootURI + 'content/icons/icon16.png';
+        toolbarIcon.alt = '✦';
+        toolbarIcon.style.cssText = 'width:16px;height:16px;flex-shrink:0;';
+        toolbarIcon.className = 'smart-highlight-icon';
+        toolbarIcon.onerror = () => { toolbarIcon.style.display = 'none'; };
+        const toolbarLabel = doc.createElement('span');
+        toolbarLabel.textContent = 'Smart Highlight All';
+        toolbarLabel.className = 'smart-highlight-label';
+        button.appendChild(toolbarIcon);
+        button.appendChild(toolbarLabel);
         attachToolbarButtonHoverState(button);
 
         button.onclick = async () => {
             button.disabled = true;
-            button.textContent = 'Scanning...';
+            setButtonText(button, 'Scanning...');
 
             try {
                 const internal = reader?._internalReader;
@@ -2928,7 +2967,7 @@ export function startup(data: BootstrapData, reason: number) {
 
                 for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
                     try {
-                        button.textContent = `Page ${pageIdx + 1}/${totalPages}`;
+                        setButtonText(button, `Page ${pageIdx + 1}/${totalPages}`);
 
                         const charPositions = await getCharPositionsForPage(internal, pageIdx, {
                             includeSyntheticEOL: true,
@@ -2955,12 +2994,12 @@ export function startup(data: BootstrapData, reason: number) {
 
                 const preparedSelection: PreparedGlobalHighlightSelection = prepareGlobalHighlightSelection(pageTexts, density, focusMode, paperTitle);
                 if (!preparedSelection.shortlist.length) {
-                    button.textContent = 'No highlights';
-                    setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2500);
+                    setButtonText(button, 'No highlights');
+                    setTimeout(() => { setButtonText(button, 'Smart Highlight All'); button.disabled = false; }, 2500);
                     return;
                 }
 
-                button.textContent = `Ranking ${preparedSelection.shortlist.length}...`;
+                setButtonText(button, `Ranking ${preparedSelection.shortlist.length}...`);
 
                 let selectedHighlights: RankedHighlightSelection[] = [];
                 try {
@@ -2988,8 +3027,8 @@ export function startup(data: BootstrapData, reason: number) {
                     }
                 } catch (rankErr: any) {
                     Zotero.debug(`[Zotero Smart Highlighter] Global ranking failed: ${rankErr?.message || rankErr}`);
-                    button.textContent = 'Error';
-                    setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2000);
+                    setButtonText(button, 'Error');
+                    setTimeout(() => { setButtonText(button, 'Smart Highlight All'); button.disabled = false; }, 2000);
                     return;
                 }
 
@@ -3007,8 +3046,8 @@ export function startup(data: BootstrapData, reason: number) {
                     }
                 }
                 if (!finalCandidates.length) {
-                    button.textContent = 'No highlights';
-                    setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2500);
+                    setButtonText(button, 'No highlights');
+                    setTimeout(() => { setButtonText(button, 'Smart Highlight All'); button.disabled = false; }, 2500);
                     return;
                 }
 
@@ -3018,7 +3057,7 @@ export function startup(data: BootstrapData, reason: number) {
                     if (!charPositions?.length) continue;
                     const pageText = pageTextByIndex.get(candidate.pageIndex);
 
-                    button.textContent = `Highlight ${totalCreated + 1}/${finalCandidates.length}`;
+                    setButtonText(button, `Highlight ${totalCreated + 1}/${finalCandidates.length}`);
                     try {
                         const created = await createPaperHighlightAnnotation(reader, attachment, candidate.pageIndex, candidate, charPositions, pageText);
                         if (created) totalCreated++;
@@ -3028,13 +3067,13 @@ export function startup(data: BootstrapData, reason: number) {
                 }
 
                 Zotero.debug(`[Zotero Smart Highlighter] Total reading highlights created: ${totalCreated}`);
-                button.textContent = totalCreated > 0 ? `${totalCreated} highlights` : 'No highlights';
-                setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 3000);
+                setButtonText(button, totalCreated > 0 ? `${totalCreated} highlights` : 'No highlights');
+                setTimeout(() => { setButtonText(button, 'Smart Highlight All'); button.disabled = false; }, 3000);
 
             } catch (error: any) {
                 Zotero.debug(`[Zotero Smart Highlighter] Toolbar reading pass failed: ${error?.message || error}`);
-                button.textContent = 'Error';
-                setTimeout(() => { button.textContent = 'Smart Highlight All'; button.disabled = false; }, 2000);
+                setButtonText(button, 'Error');
+                setTimeout(() => { setButtonText(button, 'Smart Highlight All'); button.disabled = false; }, 2000);
             }
         };
 
@@ -3045,6 +3084,7 @@ export function startup(data: BootstrapData, reason: number) {
 
 export function shutdown(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero Smart Highlighter: shutdown");
+    pluginRootURI = '';
     selectionHighlightInFlight.clear();
 
     if (registeredHandler) {

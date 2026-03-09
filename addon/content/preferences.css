@@ -3,6 +3,23 @@
     padding: 0 4px;
 }
 
+.pref-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.pref-header-logo {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+}
+
+.pref-header h2 {
+    margin: 0;
+}
+
 .pref-row {
     display: flex;
     align-items: center;
