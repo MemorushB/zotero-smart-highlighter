@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "name": "Zotero PDF Highlighter",
+  "name": "Zotero Smart Highlighter",
   "version": "0.2.0",
   "description": "LLM-powered reading assistant with worth-reading highlights for academic PDFs",
   "author": "MemorushB",
@@ -11,7 +11,7 @@
   "applications": {
     "zotero": {
       "id": "zotero-pdf-highlighter@memorushb.com",
-      "update_url": "https://raw.githubusercontent.com/MemorushB/zotero-pdf-highlighter/master/update.json",
+      "update_url": "https://raw.githubusercontent.com/MemorushB/zotero-smart-highlighter/master/update.json",
       "strict_min_version": "6.999",
       "strict_max_version": "8.*"
     }

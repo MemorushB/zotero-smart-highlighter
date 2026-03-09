@@ -3,11 +3,12 @@ import { defineConfig } from "zotero-plugin-scaffold";
 export default defineConfig({
   source: ["src", "addon"],
   dist: ".scaffold/build",
-  name: "Zotero PDF Highlighter",
+  name: "Zotero Smart Highlighter",
+  xpiName: "zotero-smart-highlighter",
   id: "zotero-pdf-highlighter@memorushb.com",
   namespace: "zotero-pdf-highlighter",
   updateURL:
-    "https://raw.githubusercontent.com/MemorushB/zotero-pdf-highlighter/master/update.json",
+    "https://raw.githubusercontent.com/MemorushB/zotero-smart-highlighter/master/update.json",
   build: {
     assets: ["addon/**/*.*"],
     fluent: {

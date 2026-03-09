@@ -2,7 +2,7 @@
 
 ## Repository overview and scope
 
-- This repository is a Zotero 8 plugin named `zotero-pdf-highlighter`.
+- This repository is the `zotero-smart-highlighter` project and ships the Zotero 8 plugin branded as `Zotero Smart Highlighter`.
 - The plugin adds named-entity-based PDF highlighting on top of Zotero's reader UI.
 - Root plugin code lives in `src/` and is authored in strict TypeScript.
 - Packaged plugin assets live in `addon/`, including bootstrap glue, manifest, locale files, and preferences assets.

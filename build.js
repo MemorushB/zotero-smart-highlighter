@@ -28,8 +28,8 @@ async function build() {
     const addonDir = path.join(__dirname, 'addon');
     addDirToZip(zip, addonDir, '');
 
-    zip.writeZip(path.join(__dirname, 'zotero-pdf-highlighter.xpi'));
-    console.log('Created zotero-pdf-highlighter.xpi');
+    zip.writeZip(path.join(__dirname, 'zotero-smart-highlighter.xpi'));
+    console.log('Created zotero-smart-highlighter.xpi');
 }
 
 function addDirToZip(zip, dirPath, zipPath) {

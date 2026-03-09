@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "description": "A Zotero 8 plugin for LLM-powered smart PDF highlighting.",
   "config": {
-    "addonName": "Zotero PDF Highlighter",
+    "addonName": "Zotero Smart Highlighter",
     "addonID": "zotero-pdf-highlighter@memorushb.com",
     "addonRef": "zotero-pdf-highlighter",
     "addonInstance": "ZoteroPDFHighlighter",
@@ -21,15 +21,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MemorushB/zotero-pdf-highlighter.git"
+    "url": "git+https://github.com/MemorushB/zotero-smart-highlighter.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/MemorushB/zotero-pdf-highlighter/issues"
+    "url": "https://github.com/MemorushB/zotero-smart-highlighter/issues"
   },
-  "homepage": "https://github.com/MemorushB/zotero-pdf-highlighter#readme",
+  "homepage": "https://github.com/MemorushB/zotero-smart-highlighter#readme",
   "devDependencies": {
     "@types/firefox-webext-browser": "^143.0.0",
     "adm-zip": "^0.5.16",
