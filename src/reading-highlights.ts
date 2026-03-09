@@ -19,6 +19,7 @@ export interface ReadingHighlightCandidate extends ReadingHighlightSpan {
     sectionKind: ReadingSectionKind;
     heuristicScore: number;
     lexicalScore?: number;
+    neuralScore?: number;
     finalScore?: number;
 }
 
@@ -68,16 +69,21 @@ export interface NonLlmSelectionInput {
 export interface NonLlmSelectionOptions {
     density?: string;
     lexicalMethod?: string;
+    neuralScores?: number[];
+    neuralRerankFn?: (query: string, candidateTexts: string[]) => Promise<number[] | null>;
 }
 
 export interface NonLlmGlobalSelectionOptions {
     lexicalMethod?: string;
     authorKeywords?: string[];
+    neuralScores?: number[];
+    neuralRerankFn?: (query: string, candidateTexts: string[]) => Promise<number[] | null>;
 }
 
 interface RankedSpanCandidate extends ReadingHighlightSpan {
     heuristicScore: number;
     lexicalScore: number;
+    neuralScore?: number;
     finalScore: number;
 }
 
@@ -333,10 +339,10 @@ export function validateQuickHighlightSpans(spans: ReadingHighlightSpan[], selec
     return validateHighlightSpans(spans, selectionText, getQuickHighlightDefaults(density));
 }
 
-export function extractSelectionHighlightsNonLlm(
+export async function extractSelectionHighlightsNonLlm(
     input: NonLlmSelectionInput,
     options: NonLlmSelectionOptions = {}
-): ReadingHighlightSpan[] {
+): Promise<ReadingHighlightSpan[]> {
     const selectionText = input.selectionText.trim();
     if (!selectionText) return [];
 
@@ -371,17 +377,26 @@ export function extractSelectionHighlightsNonLlm(
     if (!candidates.length) return [];
 
     const pseudoQuery = buildSelectionPseudoQuery(input);
-    const lexicalScores = scoreLexicalDocuments(candidates.map(candidate => candidate.text), pseudoQuery, lexicalMethod);
+    const candidateTexts = candidates.map(candidate => candidate.text);
+    const lexicalScores = scoreLexicalDocuments(candidateTexts, pseudoQuery, lexicalMethod);
     const heuristicScores = normalizeScores(candidates.map(candidate => candidate.heuristicScore));
+    const neuralScores = options.neuralScores?.length
+        ? options.neuralScores
+        : await options.neuralRerankFn?.(pseudoQuery, candidateTexts) ?? null;
+    const hasNeuralScores = Array.isArray(neuralScores) && neuralScores.length > 0;
 
     const ranked = candidates
         .map((candidate, index) => {
             const lexicalScore = lexicalScores[index] ?? 0;
             const heuristicScore = heuristicScores[index] ?? 0;
-            const finalScore = (heuristicScore * 0.72) + (lexicalScore * 0.28);
+            const neuralScore = hasNeuralScores ? (neuralScores[index] ?? 0) : undefined;
+            const finalScore = hasNeuralScores
+                ? (heuristicScore * 0.40) + (lexicalScore * 0.10) + ((neuralScore ?? 0) * 0.50)
+                : (heuristicScore * 0.72) + (lexicalScore * 0.28);
             return {
                 ...candidate,
                 lexicalScore,
+                neuralScore,
                 finalScore,
                 confidence: clamp01(finalScore),
             };
@@ -395,9 +410,9 @@ export function extractSelectionHighlightsNonLlm(
 
     const zoteroDebug = getZoteroDebug();
     if (zoteroDebug) {
-        zoteroDebug(`[Smart Highlighter selection] candidates=${candidates.length} pseudoQuery="${pseudoQuery.slice(0, 80)}..." threshold=0.22`);
+        zoteroDebug(`[Smart Highlighter selection] candidates=${candidates.length} pseudoQuery="${pseudoQuery.slice(0, 80)}..." threshold=0.22 neural=${hasNeuralScores ? 'yes' : 'no'}`);
         for (const candidate of ranked.slice(0, 5)) {
-            zoteroDebug(`[Smart Highlighter selection]   score=${candidate.finalScore.toFixed(3)} h=${candidate.heuristicScore.toFixed(3)} l=${candidate.lexicalScore.toFixed(3)} "${candidate.text.slice(0, 50)}..."`);
+            zoteroDebug(`[Smart Highlighter selection]   score=${candidate.finalScore.toFixed(3)} h=${candidate.heuristicScore.toFixed(3)} l=${candidate.lexicalScore.toFixed(3)}${candidate.neuralScore !== undefined ? ` n=${candidate.neuralScore.toFixed(3)}` : ''} "${candidate.text.slice(0, 50)}..."`);
         }
     }
 
@@ -425,32 +440,41 @@ export function prepareGlobalHighlightSelection(
     };
 }
 
-export function selectGlobalHighlightCandidateIdsNonLlm(
+export async function selectGlobalHighlightCandidateIdsNonLlm(
     prepared: PreparedGlobalHighlightSelection,
     options: NonLlmGlobalSelectionOptions = {}
-): RankedHighlightSelection[] {
+): Promise<RankedHighlightSelection[]> {
     if (!prepared.shortlist.length || prepared.maxHighlights <= 0) return [];
 
     const lexicalMethod = resolveLexicalMethod(options.lexicalMethod);
+    const candidateTexts = prepared.shortlist.map(candidate => candidate.text);
     const lexicalScores = scoreLexicalDocuments(
-        prepared.shortlist.map(candidate => candidate.text),
+        candidateTexts,
         prepared.pseudoQuery,
         lexicalMethod
     );
     const heuristicScores = normalizeScores(prepared.shortlist.map(candidate => candidate.heuristicScore));
+    const neuralScores = options.neuralScores?.length
+        ? options.neuralScores
+        : await options.neuralRerankFn?.(prepared.pseudoQuery, candidateTexts) ?? null;
+    const hasNeuralScores = Array.isArray(neuralScores) && neuralScores.length > 0;
 
     const rankedCandidates = prepared.shortlist
         .map((candidate, index) => {
             const lexicalScore = lexicalScores[index] ?? 0;
             const heuristicScore = heuristicScores[index] ?? 0;
+            const neuralScore = hasNeuralScores ? (neuralScores[index] ?? 0) : undefined;
             const reason = candidate.reason ?? inferHighlightReason(candidate.text, candidate.sectionKind);
             const reasonBonus = getReasonSectionAlignmentBonus(reason, candidate.sectionKind);
-            const finalScore = (heuristicScore * 0.68) + (lexicalScore * 0.32) + reasonBonus;
+            const finalScore = hasNeuralScores
+                ? (heuristicScore * 0.35) + (lexicalScore * 0.15) + ((neuralScore ?? 0) * 0.50) + reasonBonus
+                : (heuristicScore * 0.68) + (lexicalScore * 0.32) + reasonBonus;
 
             return {
                 ...candidate,
                 reason,
                 lexicalScore,
+                neuralScore,
                 finalScore,
             };
         })
@@ -465,10 +489,10 @@ export function selectGlobalHighlightCandidateIdsNonLlm(
 
     const zoteroDebug = getZoteroDebug();
     if (zoteroDebug) {
-        zoteroDebug(`[Smart Highlighter global] shortlist=${prepared.shortlist.length} pseudoQuery="${prepared.pseudoQuery.slice(0, 80)}..." threshold=0.2`);
+        zoteroDebug(`[Smart Highlighter global] shortlist=${prepared.shortlist.length} pseudoQuery="${prepared.pseudoQuery.slice(0, 80)}..." threshold=0.2 neural=${hasNeuralScores ? 'yes' : 'no'}`);
         const topCandidates = rankedCandidates.slice(0, 10);
         for (const candidate of topCandidates) {
-            zoteroDebug(`[Smart Highlighter global]   id=${candidate.id} score=${candidate.finalScore.toFixed(3)} h=${candidate.heuristicScore.toFixed(3)} l=${candidate.lexicalScore.toFixed(3)} reason=${candidate.reason || 'none'} section=${candidate.sectionKind} "${candidate.text.slice(0, 50)}..."`);
+            zoteroDebug(`[Smart Highlighter global]   id=${candidate.id} score=${candidate.finalScore.toFixed(3)} h=${candidate.heuristicScore.toFixed(3)} l=${candidate.lexicalScore.toFixed(3)}${candidate.neuralScore !== undefined ? ` n=${candidate.neuralScore.toFixed(3)}` : ''} reason=${candidate.reason || 'none'} section=${candidate.sectionKind} "${candidate.text.slice(0, 50)}..."`);
         }
     }
 
@@ -1085,7 +1109,7 @@ function resolveLexicalMethod(method: string | undefined): NonLlmLexicalMethod {
     return method === 'tfidf' ? 'tfidf' : 'bm25';
 }
 
-function buildSelectionPseudoQuery(input: NonLlmSelectionInput): string {
+export function buildSelectionPseudoQuery(input: NonLlmSelectionInput): string {
     const contextTerms = extractTopTerms(`${input.beforeContext ?? ''} ${input.afterContext ?? ''}`, 8);
     const titleTerms = extractTopTerms(`${input.paperTitle ?? ''} ${input.sectionTitle ?? ''}`, 8);
     const fallbackTerms = extractTopTerms(input.selectionText, 10);

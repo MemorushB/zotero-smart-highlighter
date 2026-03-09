@@ -95,6 +95,65 @@
     opacity: 0.7;
 }
 
+/* Neural Reranker section */
+.pref-section-heading {
+    font-weight: bold;
+    font-size: 12px;
+    margin-top: 12px;
+    margin-bottom: 6px;
+    color: #333;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 4px;
+}
+
+.pref-status-badge {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #e0e0e0;
+    color: #555;
+}
+
+.pref-status-badge.status-ready {
+    background: #d4edda;
+    color: #155724;
+}
+
+.pref-status-badge.status-not-supported {
+    background: #f8d7da;
+    color: #721c24;
+}
+
+.pref-status-badge.status-downloading {
+    background: #fff3cd;
+    color: #856404;
+}
+
+.pref-download-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pref-button {
+    padding: 4px 12px;
+    font-size: 11px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #f5f5f5;
+    cursor: pointer;
+}
+
+.pref-button:hover {
+    background: #e8e8e8;
+}
+
+.pref-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 @media (prefers-color-scheme: dark) {
     .pref-hint {
         color: #999;
@@ -102,5 +161,40 @@
 
     .pref-inline-hint {
         color: #aaa;
+    }
+
+    .pref-section-heading {
+        color: #ccc;
+        border-bottom-color: #555;
+    }
+
+    .pref-status-badge {
+        background: #444;
+        color: #aaa;
+    }
+
+    .pref-status-badge.status-ready {
+        background: #1e4620;
+        color: #75b798;
+    }
+
+    .pref-status-badge.status-not-supported {
+        background: #4a1c24;
+        color: #ea868f;
+    }
+
+    .pref-status-badge.status-downloading {
+        background: #4a3c04;
+        color: #e2c65e;
+    }
+
+    .pref-button {
+        background: #444;
+        border-color: #666;
+        color: #ddd;
+    }
+
+    .pref-button:hover {
+        background: #555;
     }
 }

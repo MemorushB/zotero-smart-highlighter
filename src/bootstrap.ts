@@ -8,6 +8,7 @@ import {
     DEFAULT_SYSTEM_PROMPT,
     PREF_DEFAULTS,
     PREF_PREFIX_MIGRATION_VERSION,
+    type PreferenceValue,
     getNonEmptyPreferenceValue,
     type PreferenceClearOutcome,
     type PreferenceBranchSnapshot,
@@ -45,6 +46,42 @@ import {
     type ReadingHighlightSpan,
     type RankedHighlightSelection,
 } from "./reading-highlights";
+import {
+    destroySidecarManager,
+    getSidecarManager,
+    getNeuralRerankerStatus,
+    isModelDownloaded,
+    isNeuralRerankSupported,
+    normalizeNeuralScores,
+} from "./neural-reranker";
+
+async function tryNeuralRerank(
+    query: string,
+    candidateTexts: string[]
+): Promise<number[] | null> {
+    try {
+        const status = getNeuralRerankerStatus();
+        if (status !== 'ready') {
+            Zotero.debug(`[Smart Highlighter] Neural reranker not ready (status: ${status}), skipping`);
+            return null;
+        }
+
+        const mgr = getSidecarManager(pluginRootURI || undefined);
+        await mgr.ensureRunning();
+        const rawLogits = await mgr.rerankCandidates(query, candidateTexts);
+        if (!rawLogits) {
+            Zotero.debug('[Smart Highlighter] Neural reranker returned null, skipping');
+            return null;
+        }
+
+        const normalized = normalizeNeuralScores(rawLogits);
+        Zotero.debug(`[Smart Highlighter] Neural rerank complete: ${normalized.length} scores`);
+        return normalized;
+    } catch (err: any) {
+        Zotero.debug(`[Smart Highlighter] Neural rerank failed: ${err?.message || err}`);
+        return null;
+    }
+}
 
 function extractAuthorKeywords(parentItem: any): string[] {
     const keywords: string[] = [];
@@ -299,7 +336,7 @@ type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => voi
 const PREFERENCE_KEYS = Object.keys(PREF_DEFAULTS) as PreferenceKey[];
 
 function registerPreferenceDefaults(): void {
-    for (const [key, val] of Object.entries(PREF_DEFAULTS) as Array<[PreferenceKey, string]>) {
+    for (const [key, val] of Object.entries(PREF_DEFAULTS) as Array<[PreferenceKey, (typeof PREF_DEFAULTS)[PreferenceKey]]>) {
         if (getCanonicalRawPref(key) === undefined) {
             setCanonicalPref(key, val);
         }
@@ -390,9 +427,13 @@ function showTemporaryButtonState(button: any, event: any, text: string, duratio
     setButtonState(button, 'Smart Highlight', false);
 }
 
-function formatPreferenceValueForLog(key: PreferenceKey, value: string | undefined): string {
+function formatPreferenceValueForLog(key: PreferenceKey, value: PreferenceValue | undefined): string {
     if (value === undefined) {
         return 'missing';
+    }
+
+    if (typeof value === 'boolean') {
+        return value ? 'true' : 'false';
     }
 
     if (key === 'apiKey') {
@@ -409,7 +450,7 @@ function formatPreferenceValueForLog(key: PreferenceKey, value: string | undefin
 
 function resolveMigrationWinner(snapshot: PreferenceBranchSnapshot): {
     winnerSource: 'canonical' | 'legacy' | 'default';
-    winnerValue: string | null;
+    winnerValue: PreferenceValue | null;
     cleanupLegacy: boolean;
     reason: string;
 } {
@@ -468,7 +509,7 @@ function resolveMigrationWinner(snapshot: PreferenceBranchSnapshot): {
     };
 }
 
-function verifyCanonicalPreferenceState(key: PreferenceKey, expectedValue: string | null): void {
+function verifyCanonicalPreferenceState(key: PreferenceKey, expectedValue: PreferenceValue | null): void {
     const canonicalValue = getCanonicalRawPref(key);
 
     if (expectedValue === null) {
@@ -1952,6 +1993,7 @@ async function createSelectionReadingHighlights(event: any, button: any): Promis
                 }, {
                     density,
                     lexicalMethod,
+                    neuralRerankFn: tryNeuralRerank,
                 })
             );
             spans = validateQuickHighlightSpans(backendResult.result, selectedText, density);
@@ -2829,7 +2871,7 @@ export function startup(data: BootstrapData, reason: number) {
                     : prefKey === 'globalSystemPrompt'
                         ? resolveGlobalSystemPromptPreference(getCanonicalRawPref(prefKey))
                         : getCanonicalPref(prefKey);
-                setPreferenceControlValue(input, currentValue);
+                setPreferenceControlValue(input, String(currentValue));
                 Zotero.debug(`[Zotero Smart Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
                 // Save on change
@@ -2856,7 +2898,7 @@ export function startup(data: BootstrapData, reason: number) {
                             }
                         } else if (isBlankDefaultEquivalentPreferenceValue(prefKey, value)) {
                             clearCanonicalPref(prefKey);
-                            setPreferenceControlValue(input, PREF_DEFAULTS[prefKey]);
+                            setPreferenceControlValue(input, String(PREF_DEFAULTS[prefKey]));
                         } else {
                             setCanonicalPref(prefKey, value);
                         }
@@ -2918,6 +2960,92 @@ export function startup(data: BootstrapData, reason: number) {
                 handlers.push({ el: advToggle, type: 'click', fn: toggleAdvancedSettings });
                 handlers.push({ el: advToggle, type: 'keydown', fn: handleAdvancedToggleKeydown });
             }
+
+            const neuralCheckbox = doc.getElementById('pref-neuralReranker') as HTMLInputElement | null;
+            const neuralStatus = doc.getElementById('neural-reranker-status') as HTMLElement | null;
+            const neuralDownloadBtn = doc.getElementById('neural-reranker-download-btn') as HTMLButtonElement | null;
+            const neuralDownloadRow = doc.getElementById('neural-reranker-download-row') as HTMLElement | null;
+
+            const updateNeuralRerankerUI = (): void => {
+                const status = getNeuralRerankerStatus();
+
+                if (neuralStatus) {
+                    neuralStatus.className = 'pref-status-badge';
+
+                    const statusTextMap: Record<string, { l10nId: string; cssClass: string }> = {
+                        'not-supported': {
+                            l10nId: 'pref-neural-reranker-status-not-supported',
+                            cssClass: 'status-not-supported',
+                        },
+                        'model-not-downloaded': {
+                            l10nId: 'pref-neural-reranker-status-model-not-downloaded',
+                            cssClass: '',
+                        },
+                        ready: {
+                            l10nId: 'pref-neural-reranker-status-ready',
+                            cssClass: 'status-ready',
+                        },
+                        disabled: {
+                            l10nId: 'pref-neural-reranker-status-disabled',
+                            cssClass: '',
+                        },
+                    };
+
+                    const statusInfo = statusTextMap[status] ?? statusTextMap['not-supported'];
+                    if (statusInfo.cssClass) {
+                        neuralStatus.classList.add(statusInfo.cssClass);
+                    }
+                    neuralStatus.setAttribute('data-l10n-id', statusInfo.l10nId);
+                }
+
+                if (neuralCheckbox) {
+                    neuralCheckbox.disabled = !isNeuralRerankSupported();
+                }
+
+                if (neuralDownloadRow) {
+                    neuralDownloadRow.style.display = isNeuralRerankSupported() && !isModelDownloaded() ? '' : 'none';
+                }
+            };
+
+            if (neuralCheckbox) {
+                neuralCheckbox.checked = getCanonicalPref('neuralReranker');
+
+                const saveNeuralCheckboxPreference = () => {
+                    setCanonicalPref('neuralReranker', neuralCheckbox.checked);
+                    updateNeuralRerankerUI();
+                };
+
+                neuralCheckbox.addEventListener('change', saveNeuralCheckboxPreference);
+                handlers.push({ el: neuralCheckbox, type: 'change', fn: saveNeuralCheckboxPreference });
+            }
+
+            if (neuralDownloadBtn) {
+                const handleNeuralDownloadClick = async () => {
+                    neuralDownloadBtn.disabled = true;
+                    neuralDownloadBtn.setAttribute('data-l10n-id', 'pref-neural-reranker-downloading');
+
+                    if (neuralStatus) {
+                        neuralStatus.className = 'pref-status-badge status-downloading';
+                        neuralStatus.setAttribute('data-l10n-id', 'pref-neural-reranker-status-downloading');
+                    }
+
+                    try {
+                        Zotero.debug('[ZPH] Neural reranker model download requested');
+                        Zotero.debug('[ZPH] Model download not yet implemented - placeholder');
+                    } catch (err: any) {
+                        Zotero.debug(`[ZPH] Model download failed: ${err?.message || err}`);
+                    } finally {
+                        neuralDownloadBtn.disabled = false;
+                        neuralDownloadBtn.setAttribute('data-l10n-id', 'pref-neural-reranker-download');
+                        updateNeuralRerankerUI();
+                    }
+                };
+
+                neuralDownloadBtn.addEventListener('click', handleNeuralDownloadClick);
+                handlers.push({ el: neuralDownloadBtn, type: 'click', fn: handleNeuralDownloadClick });
+            }
+
+            updateNeuralRerankerUI();
 
             // Store cleanup function
             Zotero.ZoteroPDFHighlighter.hooks._prefsCleanup = () => {
@@ -3070,7 +3198,11 @@ export function startup(data: BootstrapData, reason: number) {
                             },
                             focusMode
                         ),
-                        () => selectGlobalHighlightCandidateIdsNonLlm(preparedSelection, { lexicalMethod, authorKeywords })
+                        () => selectGlobalHighlightCandidateIdsNonLlm(preparedSelection, {
+                            lexicalMethod,
+                            authorKeywords,
+                            neuralRerankFn: tryNeuralRerank,
+                        })
                     );
                     selectedHighlights = backendResult.result;
                     Zotero.debug(`[Zotero Smart Highlighter] Global ranking resolved via ${backendResult.backend}${backendResult.usedFallback ? ' fallback' : ''}`);
@@ -3138,6 +3270,7 @@ export function startup(data: BootstrapData, reason: number) {
 
 export function shutdown(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero Smart Highlighter: shutdown");
+    destroySidecarManager();
     pluginRootURI = '';
     selectionHighlightInFlight.clear();
 

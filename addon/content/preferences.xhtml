@@ -91,6 +91,27 @@
           <html:input type="number" id="pref-minConfidence" min="0" max="1" step="0.1" class="pref-input-short"/>
           <html:span data-l10n-id="pref-min-confidence-hint" class="pref-inline-hint">0.0 (keep all) - 1.0 (strict)</html:span>
         </html:div>
+
+        <!-- Neural Reranker -->
+        <html:div class="pref-section-heading" data-l10n-id="pref-neural-reranker-heading"></html:div>
+
+        <html:div class="pref-row">
+          <html:label class="pref-label" data-l10n-id="pref-neural-reranker-enable"></html:label>
+          <html:input type="checkbox" id="pref-neuralReranker" />
+        </html:div>
+
+        <html:div class="pref-row">
+          <html:label class="pref-label" data-l10n-id="pref-neural-reranker-status"></html:label>
+          <html:span id="neural-reranker-status" class="pref-status-badge"></html:span>
+        </html:div>
+
+        <html:div class="pref-row" id="neural-reranker-download-row">
+          <html:label class="pref-label"></html:label>
+          <html:div class="pref-download-group">
+            <html:button id="neural-reranker-download-btn" class="pref-button" data-l10n-id="pref-neural-reranker-download"></html:button>
+            <html:span class="pref-hint" data-l10n-id="pref-neural-reranker-download-hint"></html:span>
+          </html:div>
+        </html:div>
       </html:div>
     </html:div>
   </html:div>
