@@ -40,9 +40,16 @@
 - `Prompt Overrides`: optional advanced settings for custom selection-mode and full-paper prompts.
 - `Min Confidence`, `Highlight Density`, and `Reading Focus`: control how aggressive the highlighting should be and which parts of a paper are prioritized.
 
-## 🔔 Disclaimer
+## 🔔 Disclaimer, About the Model & License
 
 Use this code under AGPL. No warranties are provided. Keep the laws of your locality in mind!
+The model files included in this project are repackaged from an open-source model hosted on Hugging Face.
+* **Original Model Name:** `ms-marco-MiniLM-L6-v2`
+* **Original Author/Organization:** `cross-encoder` (SentenceTransformers)
+* **Original Model URL:** [https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2)
+
+**Modifications:** We have not modified the original model weights. We only repackaged the original files to facilitate [state your purpose here, e.g., offline deployment / reducing download size].
+**License:** The model files in this repository are distributed under the original author's **Apache License 2.0**. Please refer to the `LICENSE` file in this repository for the full terms.
 
 ## 🛠️ Project status
 
