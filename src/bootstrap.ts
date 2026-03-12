@@ -8,6 +8,7 @@ import {
     DEFAULT_SYSTEM_PROMPT,
     PREF_DEFAULTS,
     PREF_PREFIX_MIGRATION_VERSION,
+    type PreferenceValue,
     getNonEmptyPreferenceValue,
     type PreferenceClearOutcome,
     type PreferenceBranchSnapshot,
@@ -45,6 +46,62 @@ import {
     type ReadingHighlightSpan,
     type RankedHighlightSelection,
 } from "./reading-highlights";
+import {
+    CURRENT_NEURAL_MODEL_ASSET,
+    compileExistingModel,
+    deleteInstalledModel,
+    downloadAndInstallModel,
+    forceRecompileModel,
+    getInstalledModelStatus,
+    getNeuralModelInstallPaths,
+    type NeuralModelInstallState,
+    type NeuralModelInstallStatus,
+} from "./neural-model-installer";
+import {
+    destroySidecarManager,
+    getSidecarManager,
+    getNeuralRerankerStatus,
+    normalizeNeuralScores,
+} from "./neural-reranker";
+import {
+    clearCurrentPluginVersion,
+    setCurrentPluginRootURI,
+    setCurrentPluginVersion,
+} from "./plugin-runtime";
+
+async function tryNeuralRerank(
+    query: string,
+    candidateTexts: string[]
+): Promise<number[] | null> {
+    try {
+        const status = getNeuralRerankerStatus();
+        const installStatus = getInstalledModelStatus();
+        const installDetail = installStatus.error ?? installStatus.detail;
+        if (status !== 'ready') {
+            const detailSuffix = installDetail ? `, detail: ${installDetail}` : '';
+            Zotero.debug(`[Smart Highlighter] Neural reranker not ready (status: ${status}, installState: ${installStatus.state}${detailSuffix}), skipping`);
+            return null;
+        }
+
+        const mgr = getSidecarManager(pluginRootURI || undefined);
+        await mgr.ensureRunning();
+        const rawLogits = await mgr.rerankCandidates(query, candidateTexts);
+        if (!rawLogits) {
+            Zotero.debug('[Smart Highlighter] Neural reranker returned null, skipping');
+            return null;
+        }
+
+        const normalized = normalizeNeuralScores(rawLogits);
+        Zotero.debug(`[Smart Highlighter] Neural rerank complete: ${normalized.length} scores`);
+        return normalized;
+    } catch (err: any) {
+        const installStatus = getInstalledModelStatus();
+        const installDetail = installStatus.error ?? installStatus.detail;
+        const detailSuffix = installDetail ? `, installDetail: ${installDetail}` : '';
+        Zotero.debug(`[Smart Highlighter] Neural rerank failed: ${err?.message || err} (installState: ${installStatus.state}${detailSuffix})`);
+        return null;
+    }
+}
 
 function extractAuthorKeywords(parentItem: any): string[] {
     const keywords: string[] = [];
@@ -111,9 +168,14 @@ const MATCH_SPACE_CHARACTERS = /[\s\u00A0\u1680\u180E\u2000-\u200A\u2028\u2029\u
 const MATCH_ZERO_WIDTH_CHARACTERS = /[\u200B\u200C\u200D\u2060\uFEFF]/u;
 const MATCH_OPENING_PUNCTUATION = new Set(['(', '[', '{']);
 const MATCH_TIGHT_LEADING_PUNCTUATION = new Set([')', ']', '}', ',', '.', ';', ':', '!', '?']);
+const PLUGIN_ICON_32_URL = 'chrome://zotero-pdf-highlighter/content/icons/icon32.png';
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
 type PreferenceControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
 type HighlightBackend = 'llm' | 'non-llm';
+type SupportedPreferenceLocale = 'en-US' | 'zh-CN';
+
+const LOCALIZED_PREFERENCE_DOCUMENTS = new WeakSet<Document>();
 
 interface HighlightBackendPolicy {
     mode: string;
@@ -121,6 +183,167 @@ interface HighlightBackendPolicy {
     initialBackend: HighlightBackend;
     allowFallbackToNonLlm: boolean;
     reason: string;
+}
+
+const NEURAL_RUNTIME_TEXT: Record<SupportedPreferenceLocale, Record<string, string>> = {
+    'en-US': {
+        'pref-neural-reranker-status-not-supported': 'Not supported (Apple silicon Mac required)',
+        'pref-neural-reranker-status-unconfigured': 'Model asset not published',
+        'pref-neural-reranker-status-not-installed': 'Not installed',
+        'pref-neural-reranker-status-not-compiled': 'Not compiled',
+        'pref-neural-reranker-status-ready': 'Ready',
+        'pref-neural-reranker-status-verifying': 'Verifying',
+        'pref-neural-reranker-status-extracting': 'Extracting',
+        'pref-neural-reranker-status-compiling': 'Compiling',
+        'pref-neural-reranker-status-corrupt': 'Corrupt',
+        'pref-neural-reranker-status-incompatible': 'Incompatible',
+        'pref-neural-reranker-status-failed': 'Failed',
+        'pref-neural-reranker-status-downloading': 'Downloading model…',
+        'pref-neural-reranker-status-disabled': 'Disabled',
+        'pref-neural-reranker-download': 'Download Model',
+        'pref-neural-reranker-download-unconfigured': 'Model Not Yet Published',
+        'pref-neural-reranker-delete': 'Delete Model',
+        'pref-neural-reranker-redownload': 'Re-download Model',
+        'pref-neural-reranker-compile': 'Compile Model',
+        'pref-neural-reranker-recompile': 'Recompile Model',
+        'pref-neural-reranker-retry-compile': 'Retry Compile',
+        'pref-neural-reranker-downloading': 'Downloading…',
+        'pref-neural-reranker-compiling': 'Compiling…',
+        'pref-neural-reranker-download-hint': 'Downloads ~25 MB for local inference and stays reusable across plugin upgrades.',
+        'pref-neural-reranker-compile-hint': 'Compiles the downloaded Core ML package locally and keeps the compiled bundle for runtime only.',
+        'pref-neural-reranker-download-hint-unconfigured': 'This build does not yet ship published model metadata, so downloads stay disabled until the asset is released and configured.',
+        'pref-neural-reranker-message-not-supported': 'Neural reranking is available only on Apple silicon Macs.',
+        'pref-neural-reranker-message-unconfigured': 'The neural model asset has not been published or configured for this build yet.',
+        'pref-neural-reranker-message-not-installed': 'Download the local model to enable neural reranking.',
+        'pref-neural-reranker-message-not-compiled': 'Raw model files are present, but the local compiled runtime bundle is missing or stale.',
+        'pref-neural-reranker-message-installed': 'Installed locally and reusable across plugin upgrades.',
+        'pref-neural-reranker-message-downloading': 'Fetching the model package.',
+        'pref-neural-reranker-message-verifying': 'Checking the downloaded package integrity.',
+        'pref-neural-reranker-message-extracting': 'Preparing local model files.',
+        'pref-neural-reranker-message-compiling': 'Compiling and smoke-loading the Core ML runtime bundle.',
+        'pref-neural-reranker-message-corrupt': 'Local model files are incomplete.',
+        'pref-neural-reranker-message-incompatible': 'Local model files do not match the supported asset version.',
+        'pref-neural-reranker-message-failed': 'The last model install attempt failed.',
+    },
+    'zh-CN': {
+        'pref-neural-reranker-status-not-supported': '不支持（需使用 Apple 芯片 Mac）',
+        'pref-neural-reranker-status-unconfigured': '模型资源尚未发布',
+        'pref-neural-reranker-status-not-installed': '未安装',
+        'pref-neural-reranker-status-not-compiled': '未编译',
+        'pref-neural-reranker-status-ready': '就绪',
+        'pref-neural-reranker-status-verifying': '校验中',
+        'pref-neural-reranker-status-extracting': '解压中',
+        'pref-neural-reranker-status-compiling': '编译中',
+        'pref-neural-reranker-status-corrupt': '已损坏',
+        'pref-neural-reranker-status-incompatible': '不兼容',
+        'pref-neural-reranker-status-failed': '失败',
+        'pref-neural-reranker-status-downloading': '正在下载模型…',
+        'pref-neural-reranker-status-disabled': '已禁用',
+        'pref-neural-reranker-download': '下载模型',
+        'pref-neural-reranker-download-unconfigured': '模型尚未发布',
+        'pref-neural-reranker-delete': '删除模型',
+        'pref-neural-reranker-redownload': '重新下载模型',
+        'pref-neural-reranker-compile': '编译模型',
+        'pref-neural-reranker-recompile': '重新编译模型',
+        'pref-neural-reranker-retry-compile': '重试编译',
+        'pref-neural-reranker-downloading': '正在下载…',
+        'pref-neural-reranker-compiling': '正在编译…',
+        'pref-neural-reranker-download-hint': '下载约 25 MB 的本地推理模型，并可在插件升级后继续复用。',
+        'pref-neural-reranker-compile-hint': '在本地编译已下载的 Core ML 模型包，并仅使用编译产物参与运行时推理。',
+        'pref-neural-reranker-download-hint-unconfigured': '当前构建尚未配置已发布的模型元数据，因此在资源发布并补齐配置前会保持禁用下载。',
+        'pref-neural-reranker-message-not-supported': '神经网络重排序仅支持 Apple 芯片 Mac。',
+        'pref-neural-reranker-message-unconfigured': '当前构建对应的神经模型资源尚未发布或尚未完成配置。',
+        'pref-neural-reranker-message-not-installed': '下载本地模型后即可启用神经网络重排序。',
+        'pref-neural-reranker-message-not-compiled': '原始模型文件已存在，但本地编译后的运行时模型缺失或已过期。',
+        'pref-neural-reranker-message-installed': '模型已安装到本地，并可在插件升级后继续复用。',
+        'pref-neural-reranker-message-downloading': '正在获取模型包。',
+        'pref-neural-reranker-message-verifying': '正在校验下载包完整性。',
+        'pref-neural-reranker-message-extracting': '正在准备本地模型文件。',
+        'pref-neural-reranker-message-compiling': '正在编译并冒烟加载 Core ML 运行时模型。',
+        'pref-neural-reranker-message-corrupt': '本地模型文件不完整。',
+        'pref-neural-reranker-message-incompatible': '本地模型文件与当前支持的资源版本不匹配。',
+        'pref-neural-reranker-message-failed': '上一次模型安装失败。',
+    },
+};
+
+function getSupportedPreferenceLocale(doc: Document): SupportedPreferenceLocale {
+    const localeCandidates = [
+        doc.documentElement?.getAttribute('lang'),
+        (doc as Document & { documentURI?: string }).documentURI,
+        typeof Zotero?.locale === 'string' ? Zotero.locale : null,
+    ];
+
+    return localeCandidates.some(candidate => typeof candidate === 'string' && candidate.toLowerCase().includes('zh'))
+        ? 'zh-CN'
+        : 'en-US';
+}
+
+async function localizePreferencePaneRoot(doc: Document, paneRoot: Element | null): Promise<void> {
+    if (!paneRoot) {
+        return;
+    }
+
+    const localization = (doc as Document & {
+        l10n?: {
+            addResourceIds?: (resourceIds: string[]) => Promise<void> | void;
+            translateFragment?: (target: Node) => Promise<void>;
+            translateElements?: (targets: Element[]) => Promise<void>;
+        };
+    }).l10n;
+    if (!localization) {
+        return;
+    }
+
+    if (!LOCALIZED_PREFERENCE_DOCUMENTS.has(doc) && typeof localization.addResourceIds === 'function') {
+        await localization.addResourceIds(['addon.ftl']);
+        LOCALIZED_PREFERENCE_DOCUMENTS.add(doc);
+    }
+
+    if (typeof localization.translateFragment === 'function') {
+        await localization.translateFragment(paneRoot);
+        return;
+    }
+
+    if (typeof localization.translateElements !== 'function') {
+        return;
+    }
+
+    const translatableElements = Array.from(paneRoot.querySelectorAll('[data-l10n-id]'));
+    if (paneRoot.hasAttribute('data-l10n-id')) {
+        translatableElements.unshift(paneRoot);
+    }
+    if (translatableElements.length) {
+        await localization.translateElements(translatableElements);
+    }
+}
+
+function isElementNode(value: unknown): value is Element {
+    return !!value
+        && typeof value === 'object'
+        && 'nodeType' in value
+        && (value as { nodeType?: unknown }).nodeType === 1;
+}
+
+function resolvePreferencePaneRoot(doc: Document, event: any): Element | null {
+    if (isElementNode(event?.currentTarget)) {
+        return event.currentTarget;
+    }
+
+    if (isElementNode(event?.target)) {
+        return event.target;
+    }
+
+    const prefContainer = doc.querySelector('.pref-container');
+    if (prefContainer?.parentElement) {
+        return prefContainer.parentElement;
+    }
+
+    return prefContainer;
+}
+
+function getNeuralRuntimeText(doc: Document, l10nId: string): string {
+    const locale = getSupportedPreferenceLocale(doc);
+    return NEURAL_RUNTIME_TEXT[locale][l10nId] ?? NEURAL_RUNTIME_TEXT['en-US'][l10nId] ?? l10nId;
 }
 
 function getHighlightColor(reason?: string): string {
@@ -172,26 +395,8 @@ function isTextareaPreferenceControl(control: Element): boolean {
 }
 
 function setPreferenceControlValue(control: Element, value: string): void {
-    const valueControl = control as PreferenceControl & { defaultValue?: string };
+    const valueControl = control as PreferenceControl;
     valueControl.value = value;
-
-    if (!isTextareaPreferenceControl(control)) {
-        return;
-    }
-
-    valueControl.defaultValue = value;
-    control.textContent = value;
-
-    const view = control.ownerDocument?.defaultView;
-    if (!view || typeof view.setTimeout !== 'function') {
-        return;
-    }
-
-    view.setTimeout(() => {
-        valueControl.value = value;
-        valueControl.defaultValue = value;
-        control.textContent = value;
-    }, 0);
 }
 
 interface AsyncTimeoutOptions {
@@ -299,7 +504,7 @@ type SelectionPopupProgressHandler = (stage: SelectionPopupProgressStage) => voi
 const PREFERENCE_KEYS = Object.keys(PREF_DEFAULTS) as PreferenceKey[];
 
 function registerPreferenceDefaults(): void {
-    for (const [key, val] of Object.entries(PREF_DEFAULTS) as Array<[PreferenceKey, string]>) {
+    for (const [key, val] of Object.entries(PREF_DEFAULTS) as Array<[PreferenceKey, (typeof PREF_DEFAULTS)[PreferenceKey]]>) {
         if (getCanonicalRawPref(key) === undefined) {
             setCanonicalPref(key, val);
         }
@@ -364,6 +569,30 @@ function setButtonState(button: any, text: string, disabled: boolean): void {
     button.disabled = disabled;
 }
 
+function createSmartHighlightInlineIcon(doc: Document): SVGSVGElement {
+    const icon = doc.createElementNS(SVG_NS, 'svg');
+    icon.setAttribute('viewBox', '0 0 16 16');
+    icon.setAttribute('width', '16');
+    icon.setAttribute('height', '16');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.setAttribute('focusable', 'false');
+    icon.classList.add('smart-highlight-icon');
+    icon.style.cssText = 'width:16px;height:16px;flex-shrink:0;display:block;';
+
+    const diamond = doc.createElementNS(SVG_NS, 'path');
+    diamond.setAttribute('d', 'M8 1.5 12.5 8 8 14.5 3.5 8Z');
+    diamond.setAttribute('fill', 'currentColor');
+    diamond.setAttribute('fill-opacity', '0.22');
+
+    const sparkle = doc.createElementNS(SVG_NS, 'path');
+    sparkle.setAttribute('d', 'M8 2.6 9.1 6.9 13.4 8 9.1 9.1 8 13.4 6.9 9.1 2.6 8 6.9 6.9Z');
+    sparkle.setAttribute('fill', 'currentColor');
+
+    icon.appendChild(diamond);
+    icon.appendChild(sparkle);
+    return icon;
+}
+
 function attachToolbarButtonHoverState(button: any): void {
     button.addEventListener('mouseenter', () => {
         if (!button.disabled) {
@@ -390,9 +619,13 @@ function showTemporaryButtonState(button: any, event: any, text: string, duratio
     setButtonState(button, 'Smart Highlight', false);
 }
 
-function formatPreferenceValueForLog(key: PreferenceKey, value: string | undefined): string {
+function formatPreferenceValueForLog(key: PreferenceKey, value: PreferenceValue | undefined): string {
     if (value === undefined) {
         return 'missing';
+    }
+
+    if (typeof value === 'boolean') {
+        return value ? 'true' : 'false';
     }
 
     if (key === 'apiKey') {
@@ -409,7 +642,7 @@ function formatPreferenceValueForLog(key: PreferenceKey, value: string | undefin
 
 function resolveMigrationWinner(snapshot: PreferenceBranchSnapshot): {
     winnerSource: 'canonical' | 'legacy' | 'default';
-    winnerValue: string | null;
+    winnerValue: PreferenceValue | null;
     cleanupLegacy: boolean;
     reason: string;
 } {
@@ -468,7 +701,7 @@ function resolveMigrationWinner(snapshot: PreferenceBranchSnapshot): {
     };
 }
 
-function verifyCanonicalPreferenceState(key: PreferenceKey, expectedValue: string | null): void {
+function verifyCanonicalPreferenceState(key: PreferenceKey, expectedValue: PreferenceValue | null): void {
     const canonicalValue = getCanonicalRawPref(key);
 
     if (expectedValue === null) {
@@ -1952,6 +2185,7 @@ async function createSelectionReadingHighlights(event: any, button: any): Promis
                 }, {
                     density,
                     lexicalMethod,
+                    neuralRerankFn: tryNeuralRerank,
                 })
             );
             spans = validateQuickHighlightSpans(backendResult.result, selectedText, density);
@@ -2776,6 +3010,8 @@ export function install(data: BootstrapData, reason: number) {
 export function startup(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero Smart Highlighter: startup");
     pluginRootURI = data.rootURI || '';
+    setCurrentPluginVersion(data.version || '');
+    setCurrentPluginRootURI(pluginRootURI);
 
     migratePreferencePrefixIfNeeded();
     registerPreferenceDefaults();
@@ -2787,7 +3023,7 @@ export function startup(data: BootstrapData, reason: number) {
     Zotero.ZoteroPDFHighlighter.hooks = {
         _prefsCleanup: null as (() => void) | null,
 
-        onPrefsLoad: (event: any) => {
+        onPrefsLoad: async (event: any) => {
             // Cleanup previous listeners if any
             Zotero.ZoteroPDFHighlighter.hooks._prefsCleanup?.();
 
@@ -2799,9 +3035,18 @@ export function startup(data: BootstrapData, reason: number) {
                 return;
             }
 
-            Zotero.debug(`[Zotero Smart Highlighter] Prefs doc: ${doc?.location?.href || 'unknown'}`);
+            const paneRoot = resolvePreferencePaneRoot(doc, event);
 
-            const inputs: Record<string, PreferenceKey> = {
+            Zotero.debug(`[Zotero Smart Highlighter] Prefs doc: ${doc?.location?.href || 'unknown'}`);
+            Zotero.debug(`[Zotero Smart Highlighter] Prefs pane root resolved: ${paneRoot?.tagName || 'missing'}`);
+            try {
+                await localizePreferencePaneRoot(doc, paneRoot);
+            } catch (error: unknown) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                Zotero.debug(`[Zotero Smart Highlighter] Failed to localize preference pane root: ${errorMessage}`);
+            }
+
+            const prefInputs: Record<string, PreferenceKey> = {
                 'pref-apiKey': 'apiKey',
                 'pref-baseURL': 'baseURL',
                 'pref-model': 'model',
@@ -2816,7 +3061,7 @@ export function startup(data: BootstrapData, reason: number) {
 
             const handlers: Array<{ el: Element; type: string; fn: EventListener }> = [];
 
-            for (const [inputId, prefKey] of Object.entries(inputs)) {
+            for (const [inputId, prefKey] of Object.entries(prefInputs)) {
                 const input = doc.getElementById(inputId) as PreferenceControl | null;
                 Zotero.debug(`[Zotero Smart Highlighter] Input ${inputId}: ${!!input}`);
 
@@ -2829,7 +3074,7 @@ export function startup(data: BootstrapData, reason: number) {
                     : prefKey === 'globalSystemPrompt'
                         ? resolveGlobalSystemPromptPreference(getCanonicalRawPref(prefKey))
                         : getCanonicalPref(prefKey);
-                setPreferenceControlValue(input, currentValue);
+                setPreferenceControlValue(input, String(currentValue));
                 Zotero.debug(`[Zotero Smart Highlighter] Loaded ${fullKey} = ${currentValue ? '***' : '(empty)'}`);
 
                 // Save on change
@@ -2856,7 +3101,7 @@ export function startup(data: BootstrapData, reason: number) {
                             }
                         } else if (isBlankDefaultEquivalentPreferenceValue(prefKey, value)) {
                             clearCanonicalPref(prefKey);
-                            setPreferenceControlValue(input, PREF_DEFAULTS[prefKey]);
+                            setPreferenceControlValue(input, String(PREF_DEFAULTS[prefKey]));
                         } else {
                             setCanonicalPref(prefKey, value);
                         }
@@ -2872,52 +3117,753 @@ export function startup(data: BootstrapData, reason: number) {
                 handlers.push({ el: input, type: 'blur', fn: saveHandler });
             }
 
-            const advToggle = doc.getElementById('advanced-toggle') as HTMLElement | null;
-            const advContent = doc.getElementById('advanced-content') as HTMLElement | null;
-            const advToggleArrow = doc.getElementById('advanced-toggle-arrow') as HTMLElement | null;
-            Zotero.debug(`[Zotero Smart Highlighter] advanced toggle elements: toggle=${!!advToggle}, content=${!!advContent}`);
+            const systemPromptTextarea = doc.getElementById('pref-systemPrompt') as HTMLTextAreaElement | null;
+            const effectiveSystemPrompt = resolveSystemPromptPreference(getCanonicalRawPref('systemPrompt'));
+            if (systemPromptTextarea) {
+                systemPromptTextarea.value = effectiveSystemPrompt;
+                Zotero.debug(`[Zotero Smart Highlighter] Prompt textarea pref-systemPrompt initialized with ${effectiveSystemPrompt.length} characters`);
+            }
 
-            const setAdvancedToggleExpanded = (expanded: boolean): void => {
-                if (advContent) {
-                    advContent.style.display = expanded ? '' : 'none';
+            const globalSystemPromptTextarea = doc.getElementById('pref-globalSystemPrompt') as HTMLTextAreaElement | null;
+            const effectiveGlobalSystemPrompt = resolveGlobalSystemPromptPreference(getCanonicalRawPref('globalSystemPrompt'));
+            if (globalSystemPromptTextarea) {
+                globalSystemPromptTextarea.value = effectiveGlobalSystemPrompt;
+                Zotero.debug(`[Zotero Smart Highlighter] Prompt textarea pref-globalSystemPrompt initialized with ${effectiveGlobalSystemPrompt.length} characters`);
+            }
+
+            const advSection = paneRoot?.querySelector('#advanced-section') as HTMLDetailsElement | null;
+            const advToggle = paneRoot?.querySelector('#advanced-toggle') as HTMLElement | null;
+            Zotero.debug(`[Zotero Smart Highlighter] advanced toggle elements: section=${!!advSection}, toggle=${!!advToggle}`);
+
+            if (advSection && advToggle) {
+                advSection.open = false;
+                advToggle.setAttribute('aria-expanded', 'false');
+
+                const syncAdvancedToggleState = (): void => {
+                    advToggle.setAttribute('aria-expanded', advSection.open ? 'true' : 'false');
+                };
+
+                const handleAdvancedSectionToggle: EventListener = () => {
+                    syncAdvancedToggleState();
+                };
+
+                syncAdvancedToggleState();
+                advSection.addEventListener('toggle', handleAdvancedSectionToggle);
+                handlers.push({ el: advSection, type: 'toggle', fn: handleAdvancedSectionToggle });
+            }
+
+            const neuralCheckbox = doc.getElementById('pref-neuralReranker') as HTMLInputElement | null;
+            const neuralStatus = doc.getElementById('neural-reranker-status') as HTMLElement | null;
+            const neuralMessage = doc.getElementById('neural-reranker-message') as HTMLElement | null;
+            const neuralActionsRow = doc.getElementById('neural-reranker-actions-row') as HTMLElement | null;
+            const neuralDownloadBtn = doc.getElementById('neural-reranker-download-btn') as HTMLButtonElement | null;
+            const neuralCompileBtn = doc.getElementById('neural-reranker-compile-btn') as HTMLButtonElement | null;
+            const neuralRecompileBtn = doc.getElementById('neural-reranker-recompile-btn') as HTMLButtonElement | null;
+            const neuralDeleteBtn = doc.getElementById('neural-reranker-delete-btn') as HTMLButtonElement | null;
+            const neuralActionsHint = doc.getElementById('neural-reranker-actions-hint') as HTMLElement | null;
+            Zotero.debug(
+                `[Zotero Smart Highlighter] Neural controls initialized: checkbox=${!!neuralCheckbox} download=${!!neuralDownloadBtn} compile=${!!neuralCompileBtn} recompile=${!!neuralRecompileBtn} delete=${!!neuralDeleteBtn}`
+            );
+
+            let neuralMutationInFlight = false;
+            let neuralTransientStatus: NeuralModelInstallStatus | null = null;
+            let lastKnownNeuralStatus: NeuralModelInstallStatus | null = null;
+            const loggedTranslationFailures = new Set<string>();
+
+            const setElementRuntimeText = (element: Element | null, text: string): void => {
+                if (!element) {
+                    return;
                 }
-                if (advToggleArrow) {
-                    advToggleArrow.textContent = expanded ? '\u25BC' : '\u25B6';
+
+                element.textContent = text;
+            };
+
+            const logPreferenceTranslationFailure = (element: Element, l10nId: string, error: unknown): void => {
+                const elementId = element.id || '(no-id)';
+                const tagName = element.tagName?.toLowerCase() || '(unknown-tag)';
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                const failureKey = [elementId, tagName, l10nId, errorMessage].join(' | ');
+                if (loggedTranslationFailures.has(failureKey)) {
+                    return;
                 }
-                if (advToggle) {
-                    advToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+
+                loggedTranslationFailures.add(failureKey);
+                Zotero.debug(
+                    `[Zotero Smart Highlighter] Failed to translate preference element id=${elementId} tag=${tagName} l10nId=${l10nId}: ${errorMessage}`
+                );
+            };
+
+            const translateElement = (element: Element | null, l10nId: string): void => {
+                if (!element) {
+                    return;
+                }
+
+                const localization = (doc as Document & {
+                    l10n?: {
+                        setAttributes?: (target: Element, l10nId: string) => void;
+                        translateElements?: (targets: Element[]) => Promise<void>;
+                    };
+                }).l10n;
+
+                if (typeof localization?.translateElements !== 'function') {
+                    return;
+                }
+
+                void localization.translateElements([element]).catch((error: unknown) => {
+                    logPreferenceTranslationFailure(element, l10nId, error);
+                });
+            };
+
+            const setElementL10nId = (
+                element: Element | null,
+                l10nId: string,
+                fallbackText?: string,
+                skipTranslate = false
+            ): void => {
+                if (!element) {
+                    return;
+                }
+
+                const localization = (doc as Document & {
+                    l10n?: {
+                        setAttributes?: (target: Element, l10nId: string) => void;
+                    };
+                }).l10n;
+
+                if (typeof localization?.setAttributes === 'function') {
+                    localization.setAttributes(element, l10nId);
+                } else {
+                    element.setAttribute('data-l10n-id', l10nId);
+                }
+
+                if (typeof fallbackText === 'string') {
+                    setElementRuntimeText(element, fallbackText);
+                }
+
+                if (!skipTranslate) {
+                    translateElement(element, l10nId);
                 }
             };
 
-            if (advToggle && advContent) {
-                const toggleAdvancedSettings = () => {
-                    const expanded = advContent.style.display === 'none';
-                    setAdvancedToggleExpanded(expanded);
+            const setElementVisible = (element: HTMLElement | null, visible: boolean): void => {
+                if (!element) {
+                    return;
+                }
+
+                element.style.display = visible ? '' : 'none';
+            };
+
+            const setButtonVisibility = (
+                button: HTMLButtonElement | null,
+                visible: boolean,
+                l10nId: string,
+                disabled: boolean
+            ): void => {
+                if (!button) {
+                    return;
+                }
+
+                setElementVisible(button, visible);
+                if (!visible) {
+                    return;
+                }
+
+                button.disabled = disabled;
+                setElementL10nId(button, l10nId, getNeuralRuntimeText(doc, l10nId));
+            };
+
+            const logNeuralInstallStatus = (context: string, status: NeuralModelInstallStatus): void => {
+                const detailSuffix = status.detail ? ` detail=${status.detail}` : '';
+                const errorSuffix = status.error ? ` error=${status.error}` : '';
+                Zotero.debug(
+                    `[Zotero Smart Highlighter] ${context}: state=${status.state}${detailSuffix}${errorSuffix}`
+                );
+            };
+
+            const getFallbackNeuralStatusSeed = (): NeuralModelInstallStatus => {
+                return lastKnownNeuralStatus ?? neuralTransientStatus ?? {
+                    state: 'failed',
+                    paths: getNeuralModelInstallPaths(),
+                    supportedAsset: CURRENT_NEURAL_MODEL_ASSET,
+                    manifest: null,
+                    isInstalledUsable: false,
+                    rawAssetsPresent: false,
+                    compiledAssetsPresent: false,
+                    missingEntries: [],
+                    missingRawEntries: [],
+                    missingCompiledEntries: [],
+                    detail: null,
+                    error: null,
+                };
+            };
+
+            const toErrorMessage = (error: unknown): string => {
+                return error instanceof Error ? error.message : String(error);
+            };
+
+            const buildNeuralUiFailureStatus = (
+                error: unknown,
+                context: string,
+                baseStatus?: NeuralModelInstallStatus | null
+            ): NeuralModelInstallStatus => {
+                const statusSeed = baseStatus ?? getFallbackNeuralStatusSeed();
+                const errorMessage = `${context}: ${toErrorMessage(error)}`;
+
+                if (statusSeed.state === 'installed') {
+                    return {
+                        ...statusSeed,
+                        detail: errorMessage,
+                        error: errorMessage,
+                    };
+                }
+
+                return {
+                    ...statusSeed,
+                    state: 'failed',
+                    isInstalledUsable: false,
+                    detail: context,
+                    error: errorMessage,
+                };
+            };
+
+            const renderFallbackNeuralRerankerUI = (installStatus: NeuralModelInstallStatus): void => {
+                const neuralEnabled = getCanonicalPref('neuralReranker');
+                const isInstalledStatus = installStatus.state === 'installed';
+                const showDownloadAction = installStatus.state === 'unconfigured'
+                    || installStatus.state === 'not-installed'
+                    || installStatus.state === 'downloading'
+                    || installStatus.state === 'verifying'
+                    || installStatus.state === 'extracting'
+                    || installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || installStatus.state === 'failed';
+                const showCompileAction = installStatus.state === 'not-compiled'
+                    || installStatus.state === 'compiling'
+                    || (installStatus.state === 'failed' && installStatus.rawAssetsPresent);
+                const showRecompileAction = installStatus.state === 'installed';
+                const showDeleteAction = installStatus.state === 'installed'
+                    || installStatus.state === 'not-compiled'
+                    || installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || (installStatus.state === 'failed'
+                        && (installStatus.rawAssetsPresent || installStatus.compiledAssetsPresent));
+                const showActionsHint = installStatus.state === 'unconfigured'
+                    || installStatus.state === 'not-installed'
+                    || installStatus.state === 'not-compiled'
+                    || installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || installStatus.state === 'failed'
+                    || Boolean(installStatus.error);
+                const downloadButtonL10nId = installStatus.state === 'unconfigured'
+                    ? 'pref-neural-reranker-download-unconfigured'
+                    : installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || installStatus.state === 'failed'
+                    ? 'pref-neural-reranker-redownload'
+                    : installStatus.state === 'downloading'
+                        || installStatus.state === 'verifying'
+                        || installStatus.state === 'extracting'
+                        ? 'pref-neural-reranker-downloading'
+                        : 'pref-neural-reranker-download';
+                const compileButtonL10nId = installStatus.state === 'compiling'
+                    ? 'pref-neural-reranker-compiling'
+                    : installStatus.state === 'failed'
+                    ? 'pref-neural-reranker-retry-compile'
+                    : 'pref-neural-reranker-compile';
+                const badgeL10nId = isInstalledStatus && !neuralEnabled
+                    ? 'pref-neural-reranker-status-disabled'
+                    : isInstalledStatus
+                    ? 'pref-neural-reranker-status-ready'
+                    : 'pref-neural-reranker-status-failed';
+                const badgeCssClass = isInstalledStatus && !neuralEnabled
+                    ? 'status-disabled'
+                    : isInstalledStatus
+                    ? 'status-ready'
+                    : 'status-failed';
+                const messageL10nId = isInstalledStatus
+                    ? 'pref-neural-reranker-message-installed'
+                    : 'pref-neural-reranker-message-failed';
+                const messageBaseText = getNeuralRuntimeText(doc, messageL10nId);
+                const messageText = formatVisibleNeuralMessage(messageBaseText, installStatus);
+
+                if (neuralStatus) {
+                    neuralStatus.className = 'pref-status-badge';
+                    neuralStatus.classList.add(badgeCssClass);
+                    setElementL10nId(neuralStatus, badgeL10nId, getNeuralRuntimeText(doc, badgeL10nId));
+                    neuralStatus.title = installStatus.error ?? installStatus.detail ?? '';
+                }
+
+                if (neuralMessage) {
+                    neuralMessage.className = 'pref-neural-message pref-hint';
+                    if (installStatus.error || installStatus.state === 'failed') {
+                        neuralMessage.classList.add('is-error');
+                    }
+                    setElementL10nId(neuralMessage, messageL10nId, messageText, messageText !== messageBaseText);
+                    neuralMessage.title = installStatus.error ?? installStatus.detail ?? '';
+                }
+
+                if (neuralCheckbox) {
+                    neuralCheckbox.checked = neuralEnabled;
+                    neuralCheckbox.disabled = neuralMutationInFlight || !isInstalledStatus;
+                }
+
+                setButtonVisibility(
+                    neuralDownloadBtn,
+                    showDownloadAction,
+                    downloadButtonL10nId,
+                    neuralMutationInFlight
+                        || installStatus.state === 'unconfigured'
+                        || installStatus.state === 'downloading'
+                        || installStatus.state === 'verifying'
+                        || installStatus.state === 'extracting'
+                );
+                setButtonVisibility(
+                    neuralCompileBtn,
+                    showCompileAction,
+                    compileButtonL10nId,
+                    neuralMutationInFlight || installStatus.state === 'compiling'
+                );
+                setButtonVisibility(
+                    neuralRecompileBtn,
+                    showRecompileAction,
+                    'pref-neural-reranker-recompile',
+                    neuralMutationInFlight
+                );
+                setButtonVisibility(
+                    neuralDeleteBtn,
+                    showDeleteAction,
+                    'pref-neural-reranker-delete',
+                    neuralMutationInFlight
+                );
+
+                if (neuralActionsHint) {
+                    setElementVisible(neuralActionsHint, showActionsHint);
+                    if (showActionsHint) {
+                        const actionsHintL10nId = installStatus.state === 'unconfigured'
+                            ? 'pref-neural-reranker-download-hint-unconfigured'
+                            : installStatus.state === 'not-compiled'
+                            ? 'pref-neural-reranker-compile-hint'
+                            : 'pref-neural-reranker-download-hint';
+                        const actionsHintText = Boolean(installStatus.error)
+                            ? messageText
+                            : getNeuralRuntimeText(doc, actionsHintL10nId);
+                        setElementL10nId(neuralActionsHint, actionsHintL10nId, actionsHintText, Boolean(installStatus.error));
+                    }
+                    neuralActionsHint.title = installStatus.error ?? installStatus.detail ?? '';
+                }
+
+                setElementVisible(neuralActionsRow, showDownloadAction || showCompileAction || showRecompileAction || showDeleteAction || showActionsHint);
+            };
+
+            const preserveUsableInstallStatusForUi = (status: NeuralModelInstallStatus): NeuralModelInstallStatus => {
+                if (status.state !== 'failed') {
+                    return status;
+                }
+
+                const canonicalStatus = getInstalledModelStatus();
+                if (canonicalStatus.state !== 'installed') {
+                    return status;
+                }
+
+                return {
+                    ...canonicalStatus,
+                    detail: status.error ?? status.detail,
+                    error: status.error,
+                };
+            };
+
+            const formatVisibleNeuralMessage = (baseText: string, installStatus: NeuralModelInstallStatus): string => {
+                void installStatus;
+                return baseText;
+            };
+
+            const getSafeCanonicalNeuralStatus = (): NeuralModelInstallStatus => {
+                const canonicalStatus = getInstalledModelStatus();
+                lastKnownNeuralStatus = canonicalStatus;
+                return canonicalStatus;
+            };
+
+            const refreshNeuralRerankerUI = (statusOverride?: NeuralModelInstallStatus | null): void => {
+                const canonicalStatus = getSafeCanonicalNeuralStatus();
+                const installStatus = statusOverride ?? neuralTransientStatus ?? canonicalStatus;
+                lastKnownNeuralStatus = installStatus;
+                const neuralEnabled = getCanonicalPref('neuralReranker');
+
+                const badgeByState: Record<NeuralModelInstallState, { l10nId: string; cssClass: string; messageL10nId: string }> = {
+                    'not-supported': {
+                        l10nId: 'pref-neural-reranker-status-not-supported',
+                        cssClass: 'status-not-supported',
+                        messageL10nId: 'pref-neural-reranker-message-not-supported',
+                    },
+                    unconfigured: {
+                        l10nId: 'pref-neural-reranker-status-unconfigured',
+                        cssClass: 'status-incompatible',
+                        messageL10nId: 'pref-neural-reranker-message-unconfigured',
+                    },
+                    'not-installed': {
+                        l10nId: 'pref-neural-reranker-status-not-installed',
+                        cssClass: 'status-not-installed',
+                        messageL10nId: 'pref-neural-reranker-message-not-installed',
+                    },
+                    'not-compiled': {
+                        l10nId: 'pref-neural-reranker-status-not-compiled',
+                        cssClass: 'status-verifying',
+                        messageL10nId: 'pref-neural-reranker-message-not-compiled',
+                    },
+                    downloading: {
+                        l10nId: 'pref-neural-reranker-status-downloading',
+                        cssClass: 'status-downloading',
+                        messageL10nId: 'pref-neural-reranker-message-downloading',
+                    },
+                    verifying: {
+                        l10nId: 'pref-neural-reranker-status-verifying',
+                        cssClass: 'status-verifying',
+                        messageL10nId: 'pref-neural-reranker-message-verifying',
+                    },
+                    extracting: {
+                        l10nId: 'pref-neural-reranker-status-extracting',
+                        cssClass: 'status-extracting',
+                        messageL10nId: 'pref-neural-reranker-message-extracting',
+                    },
+                    compiling: {
+                        l10nId: 'pref-neural-reranker-status-compiling',
+                        cssClass: 'status-verifying',
+                        messageL10nId: 'pref-neural-reranker-message-compiling',
+                    },
+                    installed: {
+                        l10nId: 'pref-neural-reranker-status-ready',
+                        cssClass: 'status-ready',
+                        messageL10nId: 'pref-neural-reranker-message-installed',
+                    },
+                    corrupt: {
+                        l10nId: 'pref-neural-reranker-status-corrupt',
+                        cssClass: 'status-corrupt',
+                        messageL10nId: 'pref-neural-reranker-message-corrupt',
+                    },
+                    incompatible: {
+                        l10nId: 'pref-neural-reranker-status-incompatible',
+                        cssClass: 'status-incompatible',
+                        messageL10nId: 'pref-neural-reranker-message-incompatible',
+                    },
+                    failed: {
+                        l10nId: 'pref-neural-reranker-status-failed',
+                        cssClass: 'status-failed',
+                        messageL10nId: 'pref-neural-reranker-message-failed',
+                    },
                 };
 
-                const handleAdvancedToggleKeydown: EventListener = (event) => {
-                    if (!(event instanceof KeyboardEvent)) {
-                        return;
-                    }
+                const badgeInfo = badgeByState[installStatus.state];
+                const badgeL10nId = installStatus.state === 'installed' && !neuralEnabled
+                    ? 'pref-neural-reranker-status-disabled'
+                    : badgeInfo.l10nId;
+                const badgeCssClass = installStatus.state === 'installed' && !neuralEnabled
+                    ? 'status-disabled'
+                    : badgeInfo.cssClass;
+                const badgeText = getNeuralRuntimeText(doc, badgeL10nId);
+                const messageBaseText = getNeuralRuntimeText(doc, badgeInfo.messageL10nId);
+                const messageText = formatVisibleNeuralMessage(messageBaseText, installStatus);
 
-                    if (event.key === 'Enter') {
-                        event.preventDefault();
-                        toggleAdvancedSettings();
-                        return;
+                if (neuralStatus) {
+                    neuralStatus.className = 'pref-status-badge';
+                    neuralStatus.classList.add(badgeCssClass);
+                    setElementL10nId(neuralStatus, badgeL10nId, badgeText);
+                    if (installStatus.detail || installStatus.error) {
+                        neuralStatus.title = installStatus.error ?? installStatus.detail ?? '';
+                    } else {
+                        neuralStatus.removeAttribute('title');
                     }
+                }
 
-                    if (event.key === ' ') {
-                        event.preventDefault();
-                        toggleAdvancedSettings();
+                if (neuralMessage) {
+                    neuralMessage.className = 'pref-neural-message pref-hint';
+                    if (
+                        installStatus.state === 'failed'
+                        || installStatus.state === 'corrupt'
+                        || installStatus.state === 'incompatible'
+                        || (installStatus.state === 'installed' && Boolean(installStatus.error))
+                    ) {
+                        neuralMessage.classList.add('is-error');
                     }
+                    setElementL10nId(
+                        neuralMessage,
+                        badgeInfo.messageL10nId,
+                        messageText,
+                        messageText !== messageBaseText
+                    );
+                    if (installStatus.detail || installStatus.error) {
+                        neuralMessage.title = installStatus.error ?? installStatus.detail ?? '';
+                    } else {
+                        neuralMessage.removeAttribute('title');
+                    }
+                }
+
+                if (neuralCheckbox) {
+                    neuralCheckbox.checked = neuralEnabled;
+                    neuralCheckbox.disabled = installStatus.state === 'not-supported'
+                        || installStatus.state === 'unconfigured'
+                        || neuralMutationInFlight;
+                }
+
+                const showDownloadAction = installStatus.state === 'unconfigured'
+                    || installStatus.state === 'not-installed'
+                    || installStatus.state === 'downloading'
+                    || installStatus.state === 'verifying'
+                    || installStatus.state === 'extracting'
+                    || installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || installStatus.state === 'failed';
+                const showCompileAction = installStatus.state === 'not-compiled'
+                    || installStatus.state === 'compiling'
+                    || (installStatus.state === 'failed' && canonicalStatus.rawAssetsPresent);
+                const showRecompileAction = installStatus.state === 'installed';
+                const showDeleteAction = installStatus.state === 'installed'
+                    || installStatus.state === 'not-compiled'
+                    || installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || (installStatus.state === 'failed'
+                        && canonicalStatus.state !== 'not-installed'
+                        && canonicalStatus.state !== 'not-supported');
+                const showActionsHint = installStatus.state === 'unconfigured'
+                    || installStatus.state === 'not-installed'
+                    || installStatus.state === 'not-compiled'
+                    || installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || installStatus.state === 'failed';
+
+                const downloadButtonL10nId = installStatus.state === 'unconfigured'
+                    ? 'pref-neural-reranker-download-unconfigured'
+                    : installStatus.state === 'corrupt'
+                    || installStatus.state === 'incompatible'
+                    || installStatus.state === 'failed'
+                    ? 'pref-neural-reranker-redownload'
+                    : installStatus.state === 'downloading'
+                        || installStatus.state === 'verifying'
+                        || installStatus.state === 'extracting'
+                        ? 'pref-neural-reranker-downloading'
+                        : 'pref-neural-reranker-download';
+                const compileButtonL10nId = installStatus.state === 'compiling'
+                    ? 'pref-neural-reranker-compiling'
+                    : installStatus.state === 'failed'
+                    ? 'pref-neural-reranker-retry-compile'
+                    : 'pref-neural-reranker-compile';
+
+                setButtonVisibility(
+                    neuralDownloadBtn,
+                    showDownloadAction,
+                    downloadButtonL10nId,
+                    neuralMutationInFlight
+                        || installStatus.state === 'unconfigured'
+                        || installStatus.state === 'downloading'
+                        || installStatus.state === 'verifying'
+                        || installStatus.state === 'extracting'
+                );
+                setButtonVisibility(
+                    neuralCompileBtn,
+                    showCompileAction,
+                    compileButtonL10nId,
+                    neuralMutationInFlight || installStatus.state === 'compiling'
+                );
+                setButtonVisibility(
+                    neuralRecompileBtn,
+                    showRecompileAction,
+                    'pref-neural-reranker-recompile',
+                    neuralMutationInFlight
+                );
+                setButtonVisibility(
+                    neuralDeleteBtn,
+                    showDeleteAction,
+                    'pref-neural-reranker-delete',
+                    neuralMutationInFlight
+                );
+
+                if (neuralActionsHint) {
+                    setElementVisible(neuralActionsHint, showActionsHint);
+                    if (showActionsHint) {
+                        const actionsHintL10nId = installStatus.state === 'unconfigured'
+                            ? 'pref-neural-reranker-download-hint-unconfigured'
+                            : installStatus.state === 'not-compiled'
+                            ? 'pref-neural-reranker-compile-hint'
+                            : 'pref-neural-reranker-download-hint';
+                        setElementL10nId(
+                            neuralActionsHint,
+                            actionsHintL10nId,
+                            getNeuralRuntimeText(doc, actionsHintL10nId)
+                        );
+                    }
+                    if (installStatus.detail || installStatus.error) {
+                        neuralActionsHint.title = installStatus.error ?? installStatus.detail ?? '';
+                    } else {
+                        neuralActionsHint.removeAttribute('title');
+                    }
+                }
+
+                setElementVisible(neuralActionsRow, showDownloadAction || showCompileAction || showRecompileAction || showDeleteAction || showActionsHint);
+            };
+
+            const safeRefreshNeuralRerankerUI = (
+                statusOverride?: NeuralModelInstallStatus | null,
+                failureContext = 'Failed to refresh neural reranker UI'
+            ): void => {
+                try {
+                    refreshNeuralRerankerUI(statusOverride);
+                } catch (error: unknown) {
+                    const fallbackStatus = buildNeuralUiFailureStatus(
+                        error,
+                        failureContext,
+                        statusOverride ?? neuralTransientStatus ?? lastKnownNeuralStatus
+                    );
+                    neuralTransientStatus = fallbackStatus;
+                    lastKnownNeuralStatus = fallbackStatus;
+                    Zotero.debug(`[Zotero Smart Highlighter] ${fallbackStatus.error}`);
+                    renderFallbackNeuralRerankerUI(fallbackStatus);
+                }
+            };
+
+            const runNeuralMutationAction = async (options: {
+                actionLabel: string;
+                initialStatus: NeuralModelInstallStatus;
+                run: (onStatus: (status: NeuralModelInstallStatus) => void) => Promise<NeuralModelInstallStatus>;
+                finalize: (status: NeuralModelInstallStatus) => NeuralModelInstallStatus | null;
+            }): Promise<void> => {
+                if (neuralMutationInFlight) {
+                    return;
+                }
+
+                neuralMutationInFlight = true;
+
+                try {
+                    neuralTransientStatus = options.initialStatus;
+                    safeRefreshNeuralRerankerUI(options.initialStatus, `${options.actionLabel} pre-refresh failed`);
+
+                    const finalStatus = await options.run((status) => {
+                        neuralTransientStatus = status;
+                        logNeuralInstallStatus(`${options.actionLabel} update`, status);
+                        safeRefreshNeuralRerankerUI(status, `${options.actionLabel} status refresh failed`);
+                    });
+
+                    logNeuralInstallStatus(`${options.actionLabel} finished`, finalStatus);
+                    neuralTransientStatus = options.finalize(finalStatus);
+                } catch (error: unknown) {
+                    const failureStatus = buildNeuralUiFailureStatus(error, `${options.actionLabel} failed`);
+                    neuralTransientStatus = failureStatus;
+                    Zotero.debug(`[Zotero Smart Highlighter] ${failureStatus.error}`);
+                } finally {
+                    neuralMutationInFlight = false;
+                    safeRefreshNeuralRerankerUI(undefined, `${options.actionLabel} final refresh failed`);
+                }
+            };
+
+            if (neuralCheckbox) {
+                neuralCheckbox.checked = getCanonicalPref('neuralReranker');
+
+                const saveNeuralCheckboxPreference = () => {
+                    setCanonicalPref('neuralReranker', neuralCheckbox.checked);
+                    safeRefreshNeuralRerankerUI(undefined, 'Failed to refresh neural reranker UI after preference change');
                 };
 
-                setAdvancedToggleExpanded(advContent.style.display !== 'none');
-                advToggle.addEventListener('click', toggleAdvancedSettings);
-                advToggle.addEventListener('keydown', handleAdvancedToggleKeydown);
-                handlers.push({ el: advToggle, type: 'click', fn: toggleAdvancedSettings });
-                handlers.push({ el: advToggle, type: 'keydown', fn: handleAdvancedToggleKeydown });
+                neuralCheckbox.addEventListener('change', saveNeuralCheckboxPreference);
+                handlers.push({ el: neuralCheckbox, type: 'change', fn: saveNeuralCheckboxPreference });
             }
+
+            if (neuralDownloadBtn) {
+                const runNeuralDownload = async (): Promise<void> => {
+                    Zotero.debug('[Zotero Smart Highlighter] Neural model install requested');
+                    await runNeuralMutationAction({
+                        actionLabel: 'Neural model installer',
+                        initialStatus: {
+                            ...getFallbackNeuralStatusSeed(),
+                            state: 'downloading',
+                            detail: getNeuralRuntimeText(doc, 'pref-neural-reranker-message-downloading'),
+                            error: null,
+                        },
+                        run: (onStatus) => downloadAndInstallModel(pluginRootURI, onStatus),
+                        finalize: (status) => status.state === 'installed' ? null : status,
+                    });
+                };
+
+                const handleNeuralDownloadClick: EventListener = () => {
+                    void runNeuralDownload();
+                };
+
+                neuralDownloadBtn.addEventListener('click', handleNeuralDownloadClick);
+                handlers.push({ el: neuralDownloadBtn, type: 'click', fn: handleNeuralDownloadClick });
+            }
+
+            if (neuralCompileBtn) {
+                const runNeuralCompile = async (): Promise<void> => {
+                    Zotero.debug('[Zotero Smart Highlighter] Neural model compile requested');
+                    await runNeuralMutationAction({
+                        actionLabel: 'Neural model compile',
+                        initialStatus: {
+                            ...getFallbackNeuralStatusSeed(),
+                            state: 'compiling',
+                            detail: getNeuralRuntimeText(doc, 'pref-neural-reranker-message-compiling'),
+                            error: null,
+                        },
+                        run: (onStatus) => compileExistingModel(pluginRootURI, onStatus),
+                        finalize: (status) => status.state === 'installed' ? null : status,
+                    });
+                };
+
+                const handleNeuralCompileClick: EventListener = () => {
+                    void runNeuralCompile();
+                };
+
+                neuralCompileBtn.addEventListener('click', handleNeuralCompileClick);
+                handlers.push({ el: neuralCompileBtn, type: 'click', fn: handleNeuralCompileClick });
+            }
+
+            if (neuralRecompileBtn) {
+                const runNeuralRecompile = async (): Promise<void> => {
+                    Zotero.debug('[Zotero Smart Highlighter] Neural model recompile requested');
+                    await runNeuralMutationAction({
+                        actionLabel: 'Neural model recompile',
+                        initialStatus: {
+                            ...getFallbackNeuralStatusSeed(),
+                            state: 'compiling',
+                            detail: getNeuralRuntimeText(doc, 'pref-neural-reranker-message-compiling'),
+                            error: null,
+                        },
+                        run: (onStatus) => forceRecompileModel(pluginRootURI, (status) => {
+                            onStatus(preserveUsableInstallStatusForUi(status));
+                        }),
+                        finalize: (status) => preserveUsableInstallStatusForUi(status),
+                    });
+                };
+
+                const handleNeuralRecompileClick: EventListener = () => {
+                    void runNeuralRecompile();
+                };
+
+                neuralRecompileBtn.addEventListener('click', handleNeuralRecompileClick);
+                handlers.push({ el: neuralRecompileBtn, type: 'click', fn: handleNeuralRecompileClick });
+            }
+
+            if (neuralDeleteBtn) {
+                const runNeuralDelete = async (): Promise<void> => {
+                    Zotero.debug('[Zotero Smart Highlighter] Neural model delete requested');
+                    await runNeuralMutationAction({
+                        actionLabel: 'Neural model delete',
+                        initialStatus: {
+                            ...getFallbackNeuralStatusSeed(),
+                            state: 'verifying',
+                            detail: 'Deleting installed neural model',
+                            error: null,
+                        },
+                        run: async () => deleteInstalledModel(),
+                        finalize: () => null,
+                    });
+                };
+
+                const handleNeuralDeleteClick: EventListener = () => {
+                    void runNeuralDelete();
+                };
+
+                neuralDeleteBtn.addEventListener('click', handleNeuralDeleteClick);
+                handlers.push({ el: neuralDeleteBtn, type: 'click', fn: handleNeuralDeleteClick });
+            }
+
+            safeRefreshNeuralRerankerUI(undefined, 'Failed to initialize neural reranker UI');
 
             // Store cleanup function
             Zotero.ZoteroPDFHighlighter.hooks._prefsCleanup = () => {
@@ -2936,7 +3882,7 @@ export function startup(data: BootstrapData, reason: number) {
             src: data.rootURI + 'content/preferences.xhtml',
             scripts: [data.rootURI + 'content/preferences.js'],
             label: 'Smart Highlight',
-            image: data.rootURI + 'content/icons/icon32.png',
+            image: PLUGIN_ICON_32_URL,
         });
     }
 
@@ -2946,17 +3892,12 @@ export function startup(data: BootstrapData, reason: number) {
         button.className = 'smart-highlight-btn';
         button.title = 'Smart Highlight';
         button.style.cssText = 'padding:4px 6px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;display:inline-flex;align-items:center;gap:4px;';
-        const img = doc.createElement('img');
-        img.src = pluginRootURI + 'content/icons/icon16.png';
-        img.alt = '✦';
-        img.style.cssText = 'width:16px;height:16px;';
-        img.className = 'smart-highlight-icon';
-        img.onerror = () => { img.style.display = 'none'; button.textContent = '✦'; };
+        const icon = createSmartHighlightInlineIcon(doc);
         const popupLabel = doc.createElement('span');
         popupLabel.className = 'smart-highlight-label';
         popupLabel.style.cssText = 'display:none;font-size:11px;';
         popupLabel.dataset.toggleable = 'true';
-        button.appendChild(img);
+        button.appendChild(icon);
         button.appendChild(popupLabel);
         attachToolbarButtonHoverState(button);
 
@@ -2975,12 +3916,7 @@ export function startup(data: BootstrapData, reason: number) {
         button.id = 'zotero-pdf-highlighter-toolbar-btn';
         button.title = 'Smart Highlight: scan entire paper';
         button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;margin-left:4px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;display:inline-flex;align-items:center;gap:4px;';
-        const toolbarIcon = doc.createElement('img');
-        toolbarIcon.src = pluginRootURI + 'content/icons/icon16.png';
-        toolbarIcon.alt = '✦';
-        toolbarIcon.style.cssText = 'width:16px;height:16px;flex-shrink:0;';
-        toolbarIcon.className = 'smart-highlight-icon';
-        toolbarIcon.onerror = () => { toolbarIcon.style.display = 'none'; };
+        const toolbarIcon = createSmartHighlightInlineIcon(doc);
         const toolbarLabel = doc.createElement('span');
         toolbarLabel.textContent = 'Smart Highlight All';
         toolbarLabel.className = 'smart-highlight-label';
@@ -3070,7 +4006,11 @@ export function startup(data: BootstrapData, reason: number) {
                             },
                             focusMode
                         ),
-                        () => selectGlobalHighlightCandidateIdsNonLlm(preparedSelection, { lexicalMethod, authorKeywords })
+                        () => selectGlobalHighlightCandidateIdsNonLlm(preparedSelection, {
+                            lexicalMethod,
+                            authorKeywords,
+                            neuralRerankFn: tryNeuralRerank,
+                        })
                     );
                     selectedHighlights = backendResult.result;
                     Zotero.debug(`[Zotero Smart Highlighter] Global ranking resolved via ${backendResult.backend}${backendResult.usedFallback ? ' fallback' : ''}`);
@@ -3138,6 +4078,8 @@ export function startup(data: BootstrapData, reason: number) {
 
 export function shutdown(data: BootstrapData, reason: number) {
     Zotero.debug("Zotero Smart Highlighter: shutdown");
+    destroySidecarManager();
+    clearCurrentPluginVersion();
     pluginRootURI = '';
     selectionHighlightInFlight.clear();
 
