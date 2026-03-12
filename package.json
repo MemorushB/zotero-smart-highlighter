@@ -1,6 +1,6 @@
 {
   "name": "zotero-pdf-highlighter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A Zotero 8 plugin for LLM-powered smart PDF highlighting.",
   "config": {
     "addonName": "Zotero Smart Highlighter",
@@ -13,10 +13,12 @@
   "scripts": {
     "postinstall": "node scripts/patch-zotero-plugin-scaffold-node25.mjs",
     "prebuild": "node scripts/patch-zotero-plugin-scaffold-node25.mjs",
-    "start": "zotero-plugin serve",
-    "build": "zotero-plugin build && tsc --noEmit",
-    "build:legacy": "node build.js",
-    "release": "zotero-plugin release",
+    "start": "node scripts/serve-with-sidecar.mjs",
+    "build": "node scripts/ensure-sidecar-build.mjs --mode build && zotero-plugin build && tsc --noEmit && node scripts/sync-scaffold-sidecar.mjs",
+    "build:sidecar": "bash scripts/build-sidecar.sh",
+    "build:legacy": "node build.js && tsc --noEmit",
+    "release": "node scripts/ensure-sidecar-build.mjs --mode release && zotero-plugin release",
+    "release:with-sidecar": "npm run release",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
