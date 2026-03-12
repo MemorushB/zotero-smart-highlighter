@@ -552,6 +552,7 @@ async function runHighlightBackendWithFallback<T>(
 // ── UI feedback helpers ──────────────────────────────────────────────
 
 function setButtonText(button: any, text: string): void {
+    button.setAttribute('aria-label', text);
     const span = button.querySelector('.smart-highlight-label');
     if (span) {
         span.textContent = text;
@@ -3891,6 +3892,7 @@ export function startup(data: BootstrapData, reason: number) {
         const button = doc.createElement('button');
         button.className = 'smart-highlight-btn';
         button.title = 'Smart Highlight';
+        button.setAttribute('aria-label', 'Smart Highlight');
         button.style.cssText = 'padding:4px 6px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;display:inline-flex;align-items:center;gap:4px;';
         const icon = createSmartHighlightInlineIcon(doc);
         const popupLabel = doc.createElement('span');
@@ -3915,6 +3917,7 @@ export function startup(data: BootstrapData, reason: number) {
         const button = doc.createElement('button');
         button.id = 'zotero-pdf-highlighter-toolbar-btn';
         button.title = 'Smart Highlight: scan entire paper';
+        button.setAttribute('aria-label', 'Smart Highlight All');
         button.style.cssText = 'padding:4px 10px;cursor:pointer;font-size:12px;margin-left:4px;border-radius:4px;border:1px solid transparent;background:transparent;transition:background 0.15s;display:inline-flex;align-items:center;gap:4px;';
         const toolbarIcon = createSmartHighlightInlineIcon(doc);
         const toolbarLabel = doc.createElement('span');
