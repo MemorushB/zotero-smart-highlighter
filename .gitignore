@@ -3,6 +3,7 @@ dist/
 *.xpi
 addon/content/scripts/
 .scaffold/
+.local-docs/
 .env
 .DS_Store
 .opencode-zotero-dev.log

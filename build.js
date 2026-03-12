@@ -2,8 +2,23 @@ const esbuild = require('esbuild');
 const AdmZip = require('adm-zip');
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
+
+function ensureFreshSidecarBuild() {
+    const ensureScriptPath = path.join(__dirname, 'scripts', 'ensure-sidecar-build.mjs');
+    const result = spawnSync(process.execPath, [ensureScriptPath, '--mode', 'build'], {
+        cwd: __dirname,
+        stdio: 'inherit',
+    });
+
+    if (result.status !== 0) {
+        process.exit(result.status ?? 1);
+    }
+}
 
 async function build() {
+    ensureFreshSidecarBuild();
+
     // Ensure output directory exists
     const outDir = path.join(__dirname, 'addon', 'content', 'scripts');
     fs.mkdirSync(outDir, { recursive: true });

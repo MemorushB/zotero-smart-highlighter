@@ -10,7 +10,7 @@ export default defineConfig({
   updateURL:
     "https://raw.githubusercontent.com/MemorushB/zotero-smart-highlighter/master/update.json",
   build: {
-    assets: ["addon/**/*.*"],
+    assets: ["addon/**/*.*", "addon/bin/**/*"],
     fluent: {
       prefixLocaleFiles: false,
       prefixFluentMessages: false,
