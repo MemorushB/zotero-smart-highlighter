@@ -92,7 +92,7 @@ function getLogPrefix(callerLabel?: string): string {
   return callerLabel ? `[Reading:${callerLabel}]` : "[Reading]";
 }
 
-function getPref(key: PreferenceKey): string {
+function getPref<K extends PreferenceKey>(key: K): (typeof import("./preferences").PREF_DEFAULTS)[K] {
   return getCanonicalPref(key);
 }
 
