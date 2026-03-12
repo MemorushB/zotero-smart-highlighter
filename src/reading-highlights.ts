@@ -383,9 +383,7 @@ export async function extractSelectionHighlightsNonLlm(
     const neuralScores = options.neuralScores?.length
         ? options.neuralScores
         : await options.neuralRerankFn?.(pseudoQuery, candidateTexts) ?? null;
-    const usableNeuralScores = Array.isArray(neuralScores) && neuralScores.length > 0
-        ? neuralScores
-        : null;
+    const usableNeuralScores = resolveNeuralScores(neuralScores, candidateTexts.length, 'selection');
     const hasNeuralScores = usableNeuralScores !== null;
 
     const ranked = candidates
@@ -813,14 +811,14 @@ function getZoteroDebug(): ZoteroDebugFunction {
     return (globalThis as { Zotero?: { debug?: (message: string) => void } }).Zotero?.debug;
 }
 
-function resolveNeuralScores(scores: number[] | null | undefined, expectedLength: number): number[] | null {
+function resolveNeuralScores(scores: number[] | null | undefined, expectedLength: number, mode: 'selection' | 'global' = 'global'): number[] | null {
     if (!Array.isArray(scores) || scores.length === 0) {
         return null;
     }
 
     if (scores.length !== expectedLength) {
         const zoteroDebug = getZoteroDebug();
-        zoteroDebug?.(`[Smart Highlighter global] Ignoring neural scores: expected ${expectedLength} scores but received ${scores.length}`);
+        zoteroDebug?.(`[Smart Highlighter ${mode}] Ignoring neural scores: expected ${expectedLength} scores but received ${scores.length}`);
         return null;
     }
 

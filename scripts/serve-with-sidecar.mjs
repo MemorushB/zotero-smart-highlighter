@@ -19,12 +19,6 @@ async function syncBundledSidecar() {
     throw new Error(`Bundled sidecar source missing: ${sourceSidecarPath}`);
   }
 
-  try {
-    await stat(path.dirname(targetSidecarPath));
-  } catch {
-    return;
-  }
-
   await mkdir(path.dirname(targetSidecarPath), { recursive: true });
   await copyFile(sourceSidecarPath, targetSidecarPath);
   await chmod(targetSidecarPath, 0o755);

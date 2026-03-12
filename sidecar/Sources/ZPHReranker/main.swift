@@ -3,6 +3,7 @@ import Foundation
 import Darwin
 
 private let sidecarVersion = "0.2.0"
+private let supportedSequenceLength = 512
 
 enum RunMode {
 	case server(ServerConfig)
@@ -196,7 +197,7 @@ final class RerankerEngine {
 	init(modelPath: String, vocabPath: String) throws {
 		self.modelPath = modelPath
 		self.vocabPath = vocabPath
-		let tokenizer = try WordPieceTokenizer(vocabPath: vocabPath, maxLength: 512)
+		let tokenizer = try WordPieceTokenizer(vocabPath: vocabPath, maxLength: supportedSequenceLength)
 		self.inferenceEngine = CoreMLInferenceEngine(tokenizer: tokenizer)
 	}
 
@@ -217,7 +218,7 @@ final class RerankerEngine {
 		fputs("Model loaded from \(modelPath) with vocab \(vocabPath)\n", stderr)
 	}
 
-	func rerank(query: String, candidates: [String], maxLength: Int = 512) throws -> [Double] {
+	func rerank(query: String, candidates: [String], maxLength: Int = supportedSequenceLength) throws -> [Double] {
 		try inferenceEngine.rerank(query: query, candidates: candidates, maxLength: maxLength)
 	}
 }
@@ -503,7 +504,18 @@ final class HTTPServer {
 
 		do {
 			let request = try decoder.decode(RerankRequest.self, from: body)
-			let scores = try engine.rerank(query: request.query, candidates: request.candidates, maxLength: request.max_length ?? 512)
+			if let requestedMaxLength = request.max_length, requestedMaxLength != supportedSequenceLength {
+				return encodeResponse(
+					statusLine: "400 Bad Request",
+					payload: ErrorResponse(error: "Unsupported max_length \(requestedMaxLength); only \(supportedSequenceLength) is supported")
+				)
+			}
+
+			let scores = try engine.rerank(
+				query: request.query,
+				candidates: request.candidates,
+				maxLength: request.max_length ?? supportedSequenceLength
+			)
 			return encodeResponse(statusLine: "200 OK", payload: RerankResponse(scores: scores))
 		} catch {
 			return encodeResponse(statusLine: "400 Bad Request", payload: ErrorResponse(error: "Invalid request: \(error.localizedDescription)"))

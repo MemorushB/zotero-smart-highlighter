@@ -249,7 +249,7 @@ export function normalizePreferenceValue<K extends PreferenceKey>(key: K, value:
     if (typeof PREF_DEFAULTS[key] === 'boolean') {
         const booleanValue = parseRawBooleanPreferenceValue(value);
         if (booleanValue === null) {
-            return false as (typeof PREF_DEFAULTS)[K];
+            return null;
         }
 
         return (isPrefDefaultEquivalent(key, booleanValue) ? null : booleanValue) as (typeof PREF_DEFAULTS)[K] | null;
