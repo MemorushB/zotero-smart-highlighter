@@ -1,6 +1,6 @@
 {
   "name": "zotero-pdf-highlighter",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "A Zotero 8 plugin for LLM-powered smart PDF highlighting.",
   "config": {
     "addonName": "Zotero Smart Highlighter",
